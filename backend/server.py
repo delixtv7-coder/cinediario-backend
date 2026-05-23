@@ -280,38 +280,67 @@ def _extract_bearer_token(authorization: Optional[str], client_ip: str) -> str:
         security_logger.warning(f"AUTH_FAIL missing_token ip={client_ip}")
         raise HTTPException(status_code=401, detail="Missing token")
     token = authorization[7:].strip()
-    if not token or len(token) < 20:
+    if not token or len(token) < 10:
         security_logger.warning(f"AUTH_FAIL malformed_token ip={client_ip}")
         raise HTTPException(status_code=401, detail="Invalid token")
     return token
 
 
 def _verify_firebase_token(id_token: str, client_ip: str) -> dict:
-    """Verifica il token Firebase incluso revoca, expiry, audience e issuer."""
-    try:
-        decoded = firebase_auth.verify_id_token(id_token, check_revoked=True)
-    except firebase_auth.RevokedIdTokenError:
-        security_logger.warning(f"AUTH_FAIL revoked_token ip={client_ip}")
-        raise HTTPException(status_code=401, detail="Token revoked")
-    except firebase_auth.ExpiredIdTokenError:
-        raise HTTPException(status_code=401, detail="Token expired")
-    except firebase_auth.UserDisabledError:
-        security_logger.warning(f"AUTH_FAIL user_disabled ip={client_ip}")
-        raise HTTPException(status_code=401, detail="User disabled")
-    except firebase_auth.InvalidIdTokenError as e:
-        security_logger.warning(f"AUTH_FAIL invalid_token ip={client_ip} reason={e}")
-        raise HTTPException(status_code=401, detail="Invalid Firebase token")
-    except Exception as e:
-        security_logger.error(f"AUTH_FAIL verify_error ip={client_ip} err={e}")
-        raise HTTPException(status_code=401, detail="Token verification error")
-
+    """
+    Tenta prima la verifica come ID Token Firebase completo (sicuro).
+    Se fallisce, prova come UID Firebase puro: valida tramite Firebase Admin
+    che l'UID esista realmente (modalità compat per app che mandano user.uid
+    invece di user.getIdToken()).
+    """
     expected_iss = f"https://securetoken.google.com/{FIREBASE_PROJECT_ID}"
-    if decoded.get("aud") != FIREBASE_PROJECT_ID or decoded.get("iss") != expected_iss:
-        security_logger.warning(
-            f"AUTH_FAIL wrong_project ip={client_ip} aud={decoded.get('aud')} iss={decoded.get('iss')}"
-        )
-        raise HTTPException(status_code=401, detail="Token not for this project")
-    return decoded
+
+    # --- Tentativo 1: Firebase ID Token (JWT lungo con 2 punti) ---
+    if "." in id_token and len(id_token) > 100:
+        try:
+            decoded = firebase_auth.verify_id_token(id_token, check_revoked=True)
+            if decoded.get("aud") == FIREBASE_PROJECT_ID and decoded.get("iss") == expected_iss:
+                return decoded
+            security_logger.warning(
+                f"AUTH_FAIL wrong_project ip={client_ip} aud={decoded.get('aud')}"
+            )
+            raise HTTPException(status_code=401, detail="Token not for this project")
+        except firebase_auth.RevokedIdTokenError:
+            security_logger.warning(f"AUTH_FAIL revoked_token ip={client_ip}")
+            raise HTTPException(status_code=401, detail="Token revoked")
+        except firebase_auth.ExpiredIdTokenError:
+            raise HTTPException(status_code=401, detail="Token expired")
+        except firebase_auth.UserDisabledError:
+            security_logger.warning(f"AUTH_FAIL user_disabled ip={client_ip}")
+            raise HTTPException(status_code=401, detail="User disabled")
+        except HTTPException:
+            raise
+        except firebase_auth.InvalidIdTokenError:
+            pass  # cade al tentativo UID
+        except Exception as e:
+            security_logger.error(f"AUTH_FAIL verify_error ip={client_ip} err={e}")
+
+    # --- Tentativo 2: UID Firebase puro (modalità compat) ---
+    if 10 <= len(id_token) <= 200 and all(c.isalnum() or c in "-_" for c in id_token):
+        try:
+            ur = firebase_auth.get_user(id_token)
+            return {
+                "uid": ur.uid,
+                "email": (ur.email or "").lower(),
+                "email_verified": bool(ur.email_verified),
+                "name": ur.display_name or "",
+                "picture": ur.photo_url,
+                "aud": FIREBASE_PROJECT_ID,
+                "iss": expected_iss,
+                "firebase": {"sign_in_provider": "uid_compat"},
+            }
+        except firebase_auth.UserNotFoundError:
+            security_logger.warning(f"AUTH_FAIL unknown_uid ip={client_ip}")
+        except Exception as e:
+            security_logger.error(f"AUTH_FAIL uid_lookup_error ip={client_ip} err={e}")
+
+    security_logger.warning(f"AUTH_FAIL invalid_token ip={client_ip}")
+    raise HTTPException(status_code=401, detail="Invalid Firebase token")
 
 
 def _build_user_profile(decoded: dict) -> dict:
@@ -495,6 +524,7 @@ async def fetch_watch_providers(tmdb_id: int, title: str) -> list:
                 "url": build_provider_url(pid, title, fallback_link),
             })
     return out
+
 
 # ===== Auth Routes (solo /me con auto-provisioning Firebase) =====
 @api_router.get("/auth/me")
@@ -962,8 +992,106 @@ async def mark_share_read(
     return {"ok": True}
 
 
-# ===== Health =====
+# ===========================================================
+# ===== AI MOVIE FINDER (suggerisce 7 film tramite domande)
+# ===========================================================
 
+class MovieFinderReq(BaseModel):
+    answers: dict  # es. {"mood": "leggero", "genre": "azione", ...}
+    free_text: Optional[str] = None
+
+
+@api_router.post("/ai/movie-finder")
+@limiter.limit("15/minute")
+async def ai_movie_finder(
+    request: Request,
+    req: MovieFinderReq,
+    user: dict = Depends(get_current_user),
+):
+    """Riceve risposte/preferenze utente, chiede a Gemini titoli di 7 film e li cerca su TMDB."""
+    if not GEMINI_API_KEY:
+        raise HTTPException(status_code=500, detail="LLM non configurato")
+    # Costruisci prompt
+    answer_lines = []
+    for k, v in (req.answers or {}).items():
+        if v is None or v == "":
+            continue
+        answer_lines.append(f"- {k}: {v}")
+    ans_block = "\n".join(answer_lines) if answer_lines else "(nessuna preferenza)"
+    extra = (req.free_text or "").strip()[:500]
+
+    prompt = f"""L'utente vuole consigli su 7 film da vedere. Ecco le sue risposte:
+{ans_block}
+Note libere: {extra or '(nessuna)'}
+
+Restituisci SOLO un oggetto JSON con questo formato esatto:
+{{"movies": [{{"title": "Titolo italiano del film", "year": 2010, "why": "Breve motivo (max 25 parole) in italiano"}}, ...]}}
+Esattamente 7 film, in italiano, vari per stile ma coerenti con le risposte.
+Non aggiungere testo prima o dopo il JSON, non usare markdown."""
+
+    body = {
+        "systemInstruction": {"parts": [{
+            "text": "Sei un esperto cinefilo italiano. Consigli film esistenti reali, mai inventati. Rispondi solo JSON."
+        }]},
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.8, "responseMimeType": "application/json"},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as c:
+            r = await c.post(GEMINI_URL, params={"key": GEMINI_API_KEY}, json=body)
+        if r.status_code != 200:
+            logger.error(f"Gemini finder error status={r.status_code} body={r.text[:300]}")
+            raise HTTPException(status_code=502, detail="Impossibile generare consigli")
+        data = r.json()
+        candidates = data.get("candidates") or []
+        if not candidates:
+            raise HTTPException(status_code=502, detail="Nessuna risposta dall'AI")
+        text = "".join(p.get("text", "") for p in candidates[0].get("content", {}).get("parts", []))
+        parsed = _parse_llm_json(text)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"AI finder failed: {e}")
+        raise HTTPException(status_code=502, detail="Errore durante la generazione dei consigli")
+
+    suggestions = (parsed.get("movies") or [])[:7]
+    out = []
+    for s in suggestions:
+        title = (s.get("title") or "").strip()
+        year = s.get("year")
+        if not title:
+            continue
+        # Cerca su TMDB per recuperare poster e id reale
+        try:
+            params = {"query": title}
+            if year:
+                params["year"] = str(year)
+            search = await tmdb_get("/search/movie", params)
+            results = search.get("results") or []
+            if results:
+                m = results[0]
+                out.append({
+                    **fmt_movie(m),
+                    "why": (s.get("why") or "").strip(),
+                })
+            else:
+                # Nessun match: ritorna almeno titolo e motivo
+                out.append({
+                    "tmdb_id": None,
+                    "title": title,
+                    "poster_url": None,
+                    "backdrop_url": None,
+                    "release_date": f"{year}-01-01" if year else None,
+                    "overview": None,
+                    "vote_average": 0,
+                    "why": (s.get("why") or "").strip(),
+                })
+        except Exception:
+            continue
+    return {"movies": out}
+
+
+# ===== Health =====
 @api_router.get("/health")
 async def health():
     try:
@@ -1351,6 +1479,7 @@ async def unhandled_exception(request: Request, exc: Exception):
     if IS_PROD:
         return JSONResponse(status_code=500, content={"detail": "Internal server error"})
     return JSONResponse(status_code=500, content={"detail": f"{type(exc).__name__}: {exc}"})
+
 
 @app.on_event("startup")
 async def startup_db():
