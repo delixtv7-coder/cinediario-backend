@@ -510,11 +510,17 @@ async def update_user_movie(request: Request, tmdb_id: int, req: UpdateMovieReq,
     if not existing:
         raise HTTPException(status_code=404, detail="Film non presente nel diario")
     updates = {k: v for k, v in req.model_dump().items() if v is not None}
-    if "status" in updates and updates["status"] not in VALID_STATUSES:
-        raise HTTPException(status_code=400, detail="status non valido")
     merged = {**existing, **updates}
     updates["overall"] = compute_overall(merged)
     updates["updated_at"] = datetime.now(timezone.utc)
+    
+    # -------------------------------------------------------------
+    # AUTO-GUARIGIONE COPERTINE: Se un vecchio film non ha la foto o il titolo, lo scarica in automatico!
+    # Questo risolve il problema dei "riquadri grigi" quando si aggiorna il voto.
+    # -------------------------------------------------------------
+    if not existing.get("movie") or not existing.get("movie", {}).get("poster_url"):
+        updates["movie"] = await _movie_snapshot(tmdb_id)
+        
     await db.user_movies.update_one({"user_id": user["user_id"], "tmdb_id": tmdb_id}, {"$set": updates})
     doc = await db.user_movies.find_one({"user_id": user["user_id"], "tmdb_id": tmdb_id}, {"_id": 0})
     return _serialize_user_movie(doc)
@@ -538,8 +544,6 @@ async def user_stats(request: Request, user: dict = Depends(get_current_user)):
             "avg_rating": {"$avg": "$overall"},
         }},
     ]
-    
-    # IL FIX DEL PROFILO È QUI (per far funzionare il grafico)
     dist_pipeline = [
         {"$match": {"user_id": user["user_id"], "status": "watched", "overall": {"$exists": True, "$ne": None}}},
         {"$group": {"_id": "$overall", "count": {"$sum": 1}}},
@@ -555,10 +559,19 @@ async def user_stats(request: Request, user: dict = Depends(get_current_user)):
         }
         total += row["count"]
         
+    # -------------------------------------------------------------
+    # SICUREZZA GRAFICO PROFILO: Non crasha più se inserisci un voto come "8.5"
+    # -------------------------------------------------------------
     rating_dist = {}
     async for row in db.user_movies.aggregate(dist_pipeline):
-        if row["_id"] is not None:
-            rating_dist[str(int(row["_id"]))] = row["count"]
+        val = row.get("_id")
+        if val is not None:
+            try:
+                # Converte in sicurezza il decimale in numero intero per il grafico
+                bucket = str(int(float(val)))
+                rating_dist[bucket] = rating_dist.get(bucket, 0) + row.get("count", 0)
+            except (ValueError, TypeError):
+                pass
 
     runtime_cursor = db.user_movies.find(
         {"user_id": user["user_id"], "status": "watched"},
@@ -798,7 +811,6 @@ class MovieFinderReq(BaseModel):
     answers: dict
     free_text: Optional[str] = None
 
-# IL FIX DELL'AI E' QUI: Manteniamo sia la rotta vecchia che quella nuova!
 @api_router.post("/discover/ai-recommend")
 @api_router.post("/ai/movie-finder")
 @limiter.limit("15/minute")
@@ -1167,15 +1179,18 @@ async def movie_quiz(request: Request, tmdb_id: int):
 
     ctx = _extract_quiz_context(details)
     
-    # IL FIX DEL PIANO B E' QUI: Se la trama italiana non c'è, scarica l'inglese!
-    if not ctx["overview"] or len(ctx["overview"]) < 30:
+    # -----------------------------------------------------------------
+    # IL PIANO B DEI QUIZ: Se la trama in italiano non esiste (o è < 30 char)
+    # scarica la trama in inglese!
+    # -----------------------------------------------------------------
+    if not ctx.get("overview") or len(ctx["overview"]) < 30:
         try:
-            en_details = await tmdb_get(f"/movie/{tmdb_id}", {"language": "en-US", "append_to_response": "credits,keywords"})
-            ctx["overview"] = _extract_quiz_context(en_details).get("overview", "")
+            en_details = await tmdb_get(f"/movie/{tmdb_id}", {"language": "en-US"})
+            ctx["overview"] = (en_details.get("overview") or "").strip()
         except Exception:
             pass
             
-    if not ctx["overview"] or len(ctx["overview"]) < 30:
+    if not ctx.get("overview") or len(ctx["overview"]) < 30:
         return _empty_quiz_payload(ctx, tmdb_id)
 
     raw = await _call_llm_for_quiz(tmdb_id, _build_quiz_prompt(ctx))
