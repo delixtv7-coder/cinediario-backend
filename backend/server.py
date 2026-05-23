@@ -1199,6 +1199,76 @@ Non aggiungere testo prima o dopo il JSON, non usare markdown."""
     return {"movies": out}
 
 
+@api_router.post("/discover/ai-recommend")
+@limiter.limit("15/minute")
+async def discover_ai_recommend(
+    request: Request,
+    req: MovieFinderReq,
+    user: dict = Depends(get_current_user),
+):
+    """Alias dell'endpoint AI movie finder usato dal frontend."""
+    return await ai_movie_finder(request, req, user)
+
+
+# ===== Debug raw quiz (per capire perché Gemini ritorna vuoto) =====
+@api_router.get("/debug/quiz-raw/{tmdb_id}")
+async def debug_quiz_raw(tmdb_id: int):
+    """Diagnosi: chiama Gemini direttamente e ritorna la risposta grezza."""
+    out = {"tmdb_id": tmdb_id, "gemini_key_set": bool(GEMINI_API_KEY), "gemini_url": GEMINI_URL}
+    if not GEMINI_API_KEY:
+        out["error"] = "GEMINI_API_KEY non configurata su Render"
+        return out
+    try:
+        details = await tmdb_get(f"/movie/{tmdb_id}", {"append_to_response": "credits,keywords"})
+    except Exception as e:
+        out["tmdb_error"] = str(e)
+        return out
+    ctx = _extract_quiz_context(details)
+    ctx = await _enrich_ctx_with_english_fallback(ctx, tmdb_id)
+    out["overview_used"] = ctx["overview"][:200] + "..." if len(ctx.get("overview", "")) > 200 else ctx.get("overview", "")
+    out["overview_length"] = len(ctx.get("overview") or "")
+    if not ctx["overview"] or len(ctx["overview"]) < 30:
+        out["result"] = "EMPTY (overview troppo corta)"
+        return out
+    prompt = _build_quiz_prompt(ctx)
+    body = {
+        "systemInstruction": {"parts": [{
+            "text": "Sei un esperto di cinema italiano. Generi quiz a scelta multipla sulla TRAMA dei film. Rispondi SOLO con un oggetto JSON valido, senza markdown, senza testo prima o dopo."
+        }]},
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.7, "responseMimeType": "application/json"},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as c:
+            r = await c.post(GEMINI_URL, params={"key": GEMINI_API_KEY}, json=body)
+        out["gemini_status"] = r.status_code
+        if r.status_code != 200:
+            out["gemini_error_body"] = r.text[:500]
+            return out
+        data = r.json()
+        out["gemini_top_keys"] = list(data.keys())
+        candidates = data.get("candidates") or []
+        out["candidates_count"] = len(candidates)
+        if candidates:
+            cand0 = candidates[0]
+            out["finish_reason"] = cand0.get("finishReason")
+            parts = (cand0.get("content") or {}).get("parts") or []
+            text = "".join(p.get("text", "") for p in parts)
+            out["text_length"] = len(text)
+            out["text_preview"] = text[:300]
+            try:
+                parsed = _parse_llm_json(text)
+                out["parsed_keys"] = list(parsed.keys())
+                out["questions_count"] = len(parsed.get("questions") or [])
+            except Exception as e:
+                out["parse_error"] = str(e)
+        if "promptFeedback" in data:
+            out["prompt_feedback"] = data["promptFeedback"]
+    except Exception as e:
+        out["call_error"] = str(e)
+    return out
+
+
 # ===== Health =====
 @api_router.get("/health")
 async def health():
@@ -1618,7 +1688,11 @@ async def movie_quiz(request: Request, tmdb_id: int):
         {"tmdb_id": tmdb_id, "lang": "it", "version": 2}, {"_id": 0}
     )
     if cached:
-        return cached.get("payload", cached)
+        payload = cached.get("payload", cached)
+        # Se il payload cachato è vuoto, scarta la cache e rigenera
+        if payload.get("questions"):
+            return payload
+        await db.movie_quizzes.delete_one({"tmdb_id": tmdb_id, "lang": "it", "version": 2})
     try:
         details = await tmdb_get(f"/movie/{tmdb_id}", {"append_to_response": "credits,keywords"})
     except HTTPException:
@@ -1631,8 +1705,11 @@ async def movie_quiz(request: Request, tmdb_id: int):
         return _empty_quiz_payload(ctx, tmdb_id)
 
     raw = await _call_llm_for_quiz(tmdb_id, _build_quiz_prompt(ctx))
+    logger.info(f"Quiz gemini raw response for tmdb={tmdb_id} length={len(raw or '')} preview={(raw or '')[:200]!r}")
     parsed = _parse_llm_json(raw)
     payload = _normalize_quiz_payload(parsed, ctx, tmdb_id)
+    if not payload.get("questions"):
+        logger.warning(f"Quiz generated EMPTY for tmdb={tmdb_id} parsed_keys={list(parsed.keys())}")
     await _cache_quiz(tmdb_id, payload)
     return payload
 
