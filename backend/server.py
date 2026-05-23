@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Header, Depends, Request, status
+from fastapi import FastAPI, APIRouter, HTTPException, Header, Depends, Request
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -496,7 +496,6 @@ async def fetch_watch_providers(tmdb_id: int, title: str) -> list:
             })
     return out
 
-
 # ===== Auth Routes (solo /me con auto-provisioning Firebase) =====
 @api_router.get("/auth/me")
 @limiter.limit("30/minute")
@@ -504,7 +503,467 @@ async def auth_me(request: Request, user: dict = Depends(get_current_user)):
     return {"user": serialize_user(user)}
 
 
+# ===========================================================
+# ===== USER MOVIES (diario personale: watched/watchlist/etc)
+# ===========================================================
+
+VALID_STATUSES = {"watched", "watchlist", "favorite", "watching"}
+
+
+async def _movie_snapshot(tmdb_id: int) -> dict:
+    """Snapshot leggero del film da TMDB per salvarlo nel diario."""
+    try:
+        details = await tmdb_get(f"/movie/{tmdb_id}")
+        return {
+            "tmdb_id": details["id"],
+            "title": details.get("title") or details.get("original_title", ""),
+            "poster_url": f"{TMDB_IMG}{details['poster_path']}" if details.get("poster_path") else None,
+            "backdrop_url": f"{TMDB_IMG}{details['backdrop_path']}" if details.get("backdrop_path") else None,
+            "release_date": details.get("release_date"),
+            "overview": details.get("overview"),
+            "vote_average": details.get("vote_average", 0),
+            "genres": [g.get("name") for g in details.get("genres", []) if g.get("name")],
+            "runtime": details.get("runtime"),
+        }
+    except Exception:
+        return {"tmdb_id": tmdb_id, "title": "", "poster_url": None}
+
+
+def _serialize_user_movie(doc: dict) -> dict:
+    return {
+        "tmdb_id": doc["tmdb_id"],
+        "status": doc.get("status"),
+        "rating": doc.get("rating"),
+        "overall": doc.get("overall"),
+        "notes": doc.get("notes"),
+        "rating_directing": doc.get("rating_directing"),
+        "rating_acting": doc.get("rating_acting"),
+        "rating_screenplay": doc.get("rating_screenplay"),
+        "rating_soundtrack": doc.get("rating_soundtrack"),
+        "rating_cinematography": doc.get("rating_cinematography"),
+        "movie": doc.get("movie") or {"tmdb_id": doc["tmdb_id"]},
+        "created_at": (doc.get("created_at") or datetime.now(timezone.utc)).isoformat(),
+        "updated_at": (doc.get("updated_at") or datetime.now(timezone.utc)).isoformat(),
+    }
+
+
+@api_router.get("/user/movies")
+@limiter.limit("60/minute")
+async def list_user_movies(
+    request: Request,
+    status: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+):
+    query = {"user_id": user["user_id"]}
+    if status:
+        if status not in VALID_STATUSES:
+            raise HTTPException(status_code=400, detail="status non valido")
+        query["status"] = status
+    cursor = db.user_movies.find(query, {"_id": 0}).sort("updated_at", -1).limit(500)
+    return [_serialize_user_movie(d) async for d in cursor]
+
+
+@api_router.get("/user/movies/{tmdb_id}")
+@limiter.limit("60/minute")
+async def get_user_movie(
+    request: Request,
+    tmdb_id: int,
+    user: dict = Depends(get_current_user),
+):
+    doc = await db.user_movies.find_one(
+        {"user_id": user["user_id"], "tmdb_id": tmdb_id}, {"_id": 0}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Film non presente nel diario")
+    return _serialize_user_movie(doc)
+
+
+@api_router.post("/user/movies")
+@limiter.limit("30/minute")
+async def upsert_user_movie(
+    request: Request,
+    req: UserMovieReq,
+    user: dict = Depends(get_current_user),
+):
+    if req.status not in VALID_STATUSES:
+        raise HTTPException(status_code=400, detail="status non valido")
+    snapshot = await _movie_snapshot(req.tmdb_id)
+    now = datetime.now(timezone.utc)
+    data = req.model_dump()
+    data["overall"] = compute_overall(data)
+    update = {
+        "user_id": user["user_id"],
+        "tmdb_id": req.tmdb_id,
+        "status": req.status,
+        "rating": req.rating,
+        "overall": data["overall"],
+        "notes": req.notes,
+        "rating_directing": req.rating_directing,
+        "rating_acting": req.rating_acting,
+        "rating_screenplay": req.rating_screenplay,
+        "rating_soundtrack": req.rating_soundtrack,
+        "rating_cinematography": req.rating_cinematography,
+        "movie": snapshot,
+        "updated_at": now,
+    }
+    await db.user_movies.update_one(
+        {"user_id": user["user_id"], "tmdb_id": req.tmdb_id},
+        {"$set": update, "$setOnInsert": {"created_at": now}},
+        upsert=True,
+    )
+    doc = await db.user_movies.find_one(
+        {"user_id": user["user_id"], "tmdb_id": req.tmdb_id}, {"_id": 0}
+    )
+    return _serialize_user_movie(doc)
+
+
+@api_router.patch("/user/movies/{tmdb_id}")
+@limiter.limit("30/minute")
+async def update_user_movie(
+    request: Request,
+    tmdb_id: int,
+    req: UpdateMovieReq,
+    user: dict = Depends(get_current_user),
+):
+    existing = await db.user_movies.find_one(
+        {"user_id": user["user_id"], "tmdb_id": tmdb_id}
+    )
+    if not existing:
+        raise HTTPException(status_code=404, detail="Film non presente nel diario")
+    updates = {k: v for k, v in req.model_dump().items() if v is not None}
+    if "status" in updates and updates["status"] not in VALID_STATUSES:
+        raise HTTPException(status_code=400, detail="status non valido")
+    merged = {**existing, **updates}
+    updates["overall"] = compute_overall(merged)
+    updates["updated_at"] = datetime.now(timezone.utc)
+    await db.user_movies.update_one(
+        {"user_id": user["user_id"], "tmdb_id": tmdb_id},
+        {"$set": updates},
+    )
+    doc = await db.user_movies.find_one(
+        {"user_id": user["user_id"], "tmdb_id": tmdb_id}, {"_id": 0}
+    )
+    return _serialize_user_movie(doc)
+
+
+@api_router.delete("/user/movies/{tmdb_id}")
+@limiter.limit("30/minute")
+async def delete_user_movie(
+    request: Request,
+    tmdb_id: int,
+    user: dict = Depends(get_current_user),
+):
+    result = await db.user_movies.delete_one(
+        {"user_id": user["user_id"], "tmdb_id": tmdb_id}
+    )
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Film non presente nel diario")
+    return {"ok": True}
+
+
+@api_router.get("/user/stats")
+@limiter.limit("30/minute")
+async def user_stats(request: Request, user: dict = Depends(get_current_user)):
+    pipeline = [
+        {"$match": {"user_id": user["user_id"]}},
+        {"$group": {
+            "_id": "$status",
+            "count": {"$sum": 1},
+            "avg_rating": {"$avg": "$overall"},
+        }},
+    ]
+    by_status = {}
+    total = 0
+    sum_minutes = 0
+    async for row in db.user_movies.aggregate(pipeline):
+        by_status[row["_id"] or "unknown"] = {
+            "count": row["count"],
+            "avg_rating": round(row["avg_rating"], 2) if row["avg_rating"] else None,
+        }
+        total += row["count"]
+    runtime_cursor = db.user_movies.find(
+        {"user_id": user["user_id"], "status": "watched"},
+        {"_id": 0, "movie.runtime": 1},
+    )
+    async for d in runtime_cursor:
+        rt = ((d.get("movie") or {}).get("runtime")) or 0
+        sum_minutes += rt
+    return {
+        "total": total,
+        "by_status": by_status,
+        "watched_minutes": sum_minutes,
+        "watched_hours": round(sum_minutes / 60, 1),
+    }
+
+
+@api_router.get("/user/recommendations")
+@limiter.limit("20/minute")
+async def user_recommendations(request: Request, user: dict = Depends(get_current_user)):
+    """Consiglia film TMDB simili agli ultimi 3 watched di voto >=4. Fallback: popular."""
+    cursor = db.user_movies.find(
+        {"user_id": user["user_id"], "status": "watched", "overall": {"$gte": 4}},
+        {"_id": 0, "tmdb_id": 1},
+    ).sort("updated_at", -1).limit(3)
+    seeds = [d["tmdb_id"] async for d in cursor]
+
+    already_ids = set()
+    async for d in db.user_movies.find({"user_id": user["user_id"]}, {"_id": 0, "tmdb_id": 1}):
+        already_ids.add(d["tmdb_id"])
+
+    if not seeds:
+        data = await tmdb_get("/movie/popular", {"page": 1})
+        recs = [fmt_movie(m) for m in data.get("results", []) if m.get("id") not in already_ids]
+        return recs[:20]
+
+    out = []
+    seen = set()
+    for seed in seeds:
+        try:
+            data = await tmdb_get(f"/movie/{seed}/recommendations", {"page": 1})
+        except Exception:
+            continue
+        for m in data.get("results", []):
+            mid = m.get("id")
+            if mid and mid not in seen and mid not in already_ids:
+                seen.add(mid)
+                out.append(fmt_movie(m))
+    return out[:20]
+
+
+# ===========================================================
+# ===== FRIENDS (richieste amicizia, lista amici)
+# ===========================================================
+
+def _friendship_key(a: str, b: str) -> dict:
+    lo, hi = sorted([a, b])
+    return {"user_lo": lo, "user_hi": hi}
+
+
+def _other_user(fr: dict, me: str) -> str:
+    return fr["user_hi"] if fr["user_lo"] == me else fr["user_lo"]
+
+
+async def _friend_profile(user_id: str) -> dict:
+    other = await db.users.find_one(
+        {"user_id": user_id},
+        {"_id": 0, "user_id": 1, "name": 1, "picture": 1, "friend_code": 1},
+    )
+    return other or {"user_id": user_id, "name": "Utente", "picture": None, "friend_code": None}
+
+
+@api_router.get("/friends")
+@limiter.limit("60/minute")
+async def list_friends(request: Request, user: dict = Depends(get_current_user)):
+    me = user["user_id"]
+    cursor = db.friendships.find(
+        {"$or": [{"user_lo": me}, {"user_hi": me}], "status": "accepted"},
+        {"_id": 0},
+    )
+    out = []
+    async for fr in cursor:
+        out.append(await _friend_profile(_other_user(fr, me)))
+    return out
+
+
+@api_router.get("/friends/requests")
+@limiter.limit("60/minute")
+async def list_friend_requests(request: Request, user: dict = Depends(get_current_user)):
+    me = user["user_id"]
+    incoming, outgoing = [], []
+    cursor = db.friendships.find(
+        {"$or": [{"user_lo": me}, {"user_hi": me}], "status": "pending"},
+        {"_id": 0},
+    )
+    async for fr in cursor:
+        other_profile = await _friend_profile(_other_user(fr, me))
+        entry = {
+            "id": fr.get("request_id"),
+            "user": other_profile,
+            "created_at": (fr.get("created_at") or datetime.now(timezone.utc)).isoformat(),
+        }
+        if fr.get("requested_by") == me:
+            outgoing.append(entry)
+        else:
+            incoming.append(entry)
+    return {"incoming": incoming, "outgoing": outgoing}
+
+
+class FriendRequestReq(BaseModel):
+    friend_code: str
+
+
+@api_router.post("/friends/requests")
+@limiter.limit("10/minute")
+async def send_friend_request(
+    request: Request,
+    req: FriendRequestReq,
+    user: dict = Depends(get_current_user),
+):
+    code = req.friend_code.strip().upper()
+    if not code:
+        raise HTTPException(status_code=400, detail="Codice amico mancante")
+    target = await db.users.find_one({"friend_code": code}, {"_id": 0})
+    if not target:
+        raise HTTPException(status_code=404, detail="Codice amico non trovato")
+    if target["user_id"] == user["user_id"]:
+        raise HTTPException(status_code=400, detail="Non puoi aggiungere te stesso")
+    key = _friendship_key(user["user_id"], target["user_id"])
+    existing = await db.friendships.find_one(key)
+    if existing:
+        if existing.get("status") == "accepted":
+            raise HTTPException(status_code=400, detail="Siete già amici")
+        raise HTTPException(status_code=400, detail="Richiesta già in corso")
+    request_id = f"fr_{uuid.uuid4().hex[:12]}"
+    await db.friendships.insert_one({
+        **key,
+        "request_id": request_id,
+        "requested_by": user["user_id"],
+        "status": "pending",
+        "created_at": datetime.now(timezone.utc),
+    })
+    return {"ok": True, "request_id": request_id, "to": await _friend_profile(target["user_id"])}
+
+
+@api_router.post("/friends/requests/{request_id}/accept")
+@limiter.limit("30/minute")
+async def accept_friend_request(
+    request: Request,
+    request_id: str,
+    user: dict = Depends(get_current_user),
+):
+    fr = await db.friendships.find_one({"request_id": request_id, "status": "pending"})
+    if not fr:
+        raise HTTPException(status_code=404, detail="Richiesta non trovata")
+    me = user["user_id"]
+    if me not in (fr["user_lo"], fr["user_hi"]) or fr.get("requested_by") == me:
+        raise HTTPException(status_code=403, detail="Non puoi accettare questa richiesta")
+    await db.friendships.update_one(
+        {"request_id": request_id},
+        {"$set": {"status": "accepted", "accepted_at": datetime.now(timezone.utc)}},
+    )
+    return {"ok": True, "friend": await _friend_profile(_other_user(fr, me))}
+
+
+@api_router.post("/friends/requests/{request_id}/decline")
+@limiter.limit("30/minute")
+async def decline_friend_request(
+    request: Request,
+    request_id: str,
+    user: dict = Depends(get_current_user),
+):
+    fr = await db.friendships.find_one({"request_id": request_id, "status": "pending"})
+    if not fr:
+        raise HTTPException(status_code=404, detail="Richiesta non trovata")
+    me = user["user_id"]
+    if me not in (fr["user_lo"], fr["user_hi"]):
+        raise HTTPException(status_code=403, detail="Non puoi rifiutare questa richiesta")
+    await db.friendships.delete_one({"request_id": request_id})
+    return {"ok": True}
+
+
+@api_router.delete("/friends/{friend_user_id}")
+@limiter.limit("30/minute")
+async def remove_friend(
+    request: Request,
+    friend_user_id: str,
+    user: dict = Depends(get_current_user),
+):
+    key = _friendship_key(user["user_id"], friend_user_id)
+    result = await db.friendships.delete_one({**key, "status": "accepted"})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Amicizia non trovata")
+    return {"ok": True}
+
+
+# ===========================================================
+# ===== SHARES (condivisione film tra amici, posta in arrivo)
+# ===========================================================
+
+class ShareReq(BaseModel):
+    to_user_id: str
+    tmdb_id: int
+    message: Optional[str] = None
+
+
+async def _are_friends(a: str, b: str) -> bool:
+    key = _friendship_key(a, b)
+    fr = await db.friendships.find_one({**key, "status": "accepted"})
+    return fr is not None
+
+
+@api_router.get("/shares/unread-count")
+@limiter.limit("120/minute")
+async def shares_unread_count(request: Request, user: dict = Depends(get_current_user)):
+    count = await db.shares.count_documents(
+        {"to_user_id": user["user_id"], "read": False}
+    )
+    return {"count": count}
+
+
+@api_router.get("/shares/inbox")
+@limiter.limit("60/minute")
+async def shares_inbox(request: Request, user: dict = Depends(get_current_user)):
+    cursor = db.shares.find(
+        {"to_user_id": user["user_id"]}, {"_id": 0}
+    ).sort("created_at", -1).limit(100)
+    out = []
+    async for s in cursor:
+        out.append({
+            "share_id": s["share_id"],
+            "from": await _friend_profile(s["from_user_id"]),
+            "tmdb_id": s["tmdb_id"],
+            "movie": s.get("movie"),
+            "message": s.get("message"),
+            "read": bool(s.get("read", False)),
+            "created_at": (s.get("created_at") or datetime.now(timezone.utc)).isoformat(),
+        })
+    return out
+
+
+@api_router.post("/shares")
+@limiter.limit("20/minute")
+async def create_share(
+    request: Request,
+    req: ShareReq,
+    user: dict = Depends(get_current_user),
+):
+    if req.to_user_id == user["user_id"]:
+        raise HTTPException(status_code=400, detail="Non puoi condividere con te stesso")
+    if not await _are_friends(user["user_id"], req.to_user_id):
+        raise HTTPException(status_code=403, detail="Puoi condividere solo con i tuoi amici")
+    snapshot = await _movie_snapshot(req.tmdb_id)
+    share_id = f"sh_{uuid.uuid4().hex[:12]}"
+    await db.shares.insert_one({
+        "share_id": share_id,
+        "from_user_id": user["user_id"],
+        "to_user_id": req.to_user_id,
+        "tmdb_id": req.tmdb_id,
+        "movie": snapshot,
+        "message": (req.message or "").strip()[:500] or None,
+        "read": False,
+        "created_at": datetime.now(timezone.utc),
+    })
+    return {"ok": True, "share_id": share_id}
+
+
+@api_router.post("/shares/{share_id}/read")
+@limiter.limit("60/minute")
+async def mark_share_read(
+    request: Request,
+    share_id: str,
+    user: dict = Depends(get_current_user),
+):
+    result = await db.shares.update_one(
+        {"share_id": share_id, "to_user_id": user["user_id"]},
+        {"$set": {"read": True, "read_at": datetime.now(timezone.utc)}},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Condivisione non trovata")
+    return {"ok": True}
+
+
 # ===== Health =====
+
 @api_router.get("/health")
 async def health():
     try:
@@ -893,12 +1352,17 @@ async def unhandled_exception(request: Request, exc: Exception):
         return JSONResponse(status_code=500, content={"detail": "Internal server error"})
     return JSONResponse(status_code=500, content={"detail": f"{type(exc).__name__}: {exc}"})
 
-
 @app.on_event("startup")
 async def startup_db():
     await db.users.create_index("user_id", unique=True)
     await db.users.create_index("email", sparse=True)
     await db.users.create_index("friend_code", unique=True, sparse=True)
+    await db.user_movies.create_index([("user_id", 1), ("tmdb_id", 1)], unique=True)
+    await db.user_movies.create_index([("user_id", 1), ("status", 1), ("updated_at", -1)])
+    await db.friendships.create_index([("user_lo", 1), ("user_hi", 1)], unique=True)
+    await db.friendships.create_index("request_id", unique=True, sparse=True)
+    await db.shares.create_index("share_id", unique=True)
+    await db.shares.create_index([("to_user_id", 1), ("read", 1), ("created_at", -1)])
     logger.info("CineDiario backend ready (Firebase Auth + MongoDB Atlas + Security hardened)")
 
 @app.on_event("shutdown")
