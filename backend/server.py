@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Header, Depends, Request
+from fastapi import FastAPI, APIRouter, HTTPException, Header, Depends, Request, status
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -9,7 +9,7 @@ import os
 import logging
 from pathlib import Path
 from pydantic import BaseModel
-from typing import Optional
+from typing import List, Optional
 import uuid
 from datetime import datetime, timezone
 import httpx
@@ -33,6 +33,7 @@ security_logger = logging.getLogger("cinediario.security")
 
 # ===== MongoDB connection (MongoDB Atlas) =====
 mongo_url = os.environ['MONGO_URL']
+# tls=true è raccomandato per Atlas, ma "mongodb+srv://" lo abilita già di default
 client = AsyncIOMotorClient(
     mongo_url,
     serverSelectionTimeoutMS=8000,
@@ -55,15 +56,21 @@ TMDB_HEADERS = {"Authorization": f"Bearer {TMDB_TOKEN}", "accept": "application/
 TMDB_LANG = "it-IT"
 
 # ===== Security config (da env) =====
+# Lista di origini autorizzate per il CORS (es. il tuo dominio Expo Web, app mobili usano scheme custom)
+# Esempio: ALLOWED_ORIGINS="https://cinediario.app,https://www.cinediario.app"
 ALLOWED_ORIGINS = [o.strip() for o in os.environ.get('ALLOWED_ORIGINS', '').split(',') if o.strip()]
+# Lista di host accettati a livello HTTP (proteggi da Host header injection)
+# Esempio: ALLOWED_HOSTS="cinediario-api.onrender.com"
 ALLOWED_HOSTS = [h.strip() for h in os.environ.get('ALLOWED_HOSTS', '*').split(',') if h.strip()]
+# Limite size body in bytes (default 1 MB)
 MAX_BODY_BYTES = int(os.environ.get('MAX_BODY_BYTES', 1_048_576))
+# Project ID Firebase: usato anche per validare audience/issuer del token
 FIREBASE_PROJECT_ID = os.environ['FIREBASE_PROJECT_ID']
+# Ambiente: in "production" non leakkiamo dettagli errori
 APP_ENV = os.environ.get('APP_ENV', 'production').lower()
 IS_PROD = APP_ENV == 'production'
 
-
-# ===== Firebase Admin initialization =====
+# ===== Firebase Admin initialization (credenziali da variabili d'ambiente) =====
 def _init_firebase():
     if firebase_admin._apps:
         return
@@ -78,7 +85,6 @@ def _init_firebase():
         "token_uri": "https://oauth2.googleapis.com/token",
     })
     firebase_admin.initialize_app(cred, {"projectId": project_id})
-
 
 _init_firebase()
 
@@ -146,21 +152,19 @@ COUNTRY_IT = {
     "East Germany": "Germania Est",
 }
 
-
 def translate_country(name: str) -> str:
     if not name:
         return name
     return COUNTRY_IT.get(name, name)
 
 
-# ===== Rate limiter =====
+# ===== Rate limiter avanzato =====
 def _rate_key(request: Request) -> str:
-    """Rate limit per token se autenticato, altrimenti per IP."""
+    """Rate limit per UID se autenticato, altrimenti per IP."""
     auth = request.headers.get("authorization", "")
     if auth.startswith("Bearer ") and len(auth) > 20:
-        return f"bearer:{auth[7:27]}"
+        return f"bearer:{auth[7:27]}"  # primi 20 char del token come fingerprint
     return get_remote_address(request)
-
 
 limiter = Limiter(key_func=_rate_key, default_limits=["120/minute"])
 
@@ -183,8 +187,12 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
         response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+        # CSP base: l'API non serve HTML, quindi blocchiamo qualsiasi risorsa
         response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'"
-        response.headers.pop("Server", None)
+        try:
+            del response.headers["Server"]
+        except KeyError:
+            pass
         return response
 
 
@@ -192,12 +200,14 @@ class BodySizeLimitMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         cl = request.headers.get("content-length")
         if cl and cl.isdigit() and int(cl) > MAX_BODY_BYTES:
-            return JSONResponse(status_code=413, content={"detail": "Payload troppo grande"})
+            return JSONResponse(
+                status_code=413,
+                content={"detail": "Payload troppo grande"},
+            )
         return await call_next(request)
 
 
 api_router = APIRouter(prefix="/api")
-
 
 # ===== Models =====
 class UserMovieReq(BaseModel):
@@ -210,7 +220,6 @@ class UserMovieReq(BaseModel):
     rating_screenplay: Optional[float] = None
     rating_soundtrack: Optional[float] = None
     rating_cinematography: Optional[float] = None
-
 
 class UpdateMovieReq(BaseModel):
     status: Optional[str] = None
@@ -236,6 +245,7 @@ def serialize_user(user: dict) -> dict:
 
 
 def _generate_friend_code() -> str:
+    """Genera codice amico cripto-sicuro (non più `random`)."""
     alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     suffix = "".join(secrets.choice(alphabet) for _ in range(6))
     return f"CIN-{suffix}"
@@ -265,6 +275,7 @@ async def ensure_friend_code(user: dict) -> str:
 
 
 def _extract_bearer_token(authorization: Optional[str], client_ip: str) -> str:
+    """Estrae e valida la presenza dell'header Bearer."""
     if not authorization or not authorization.startswith("Bearer "):
         security_logger.warning(f"AUTH_FAIL missing_token ip={client_ip}")
         raise HTTPException(status_code=401, detail="Missing token")
@@ -276,6 +287,7 @@ def _extract_bearer_token(authorization: Optional[str], client_ip: str) -> str:
 
 
 def _verify_firebase_token(id_token: str, client_ip: str) -> dict:
+    """Verifica il token Firebase incluso revoca, expiry, audience e issuer."""
     try:
         decoded = firebase_auth.verify_id_token(id_token, check_revoked=True)
     except firebase_auth.RevokedIdTokenError:
@@ -303,6 +315,7 @@ def _verify_firebase_token(id_token: str, client_ip: str) -> dict:
 
 
 def _build_user_profile(decoded: dict) -> dict:
+    """Estrae i dati profilo dal token decodificato Firebase."""
     uid = decoded.get("uid") or decoded.get("user_id")
     if not uid:
         raise HTTPException(status_code=401, detail="UID mancante nel token")
@@ -318,6 +331,7 @@ def _build_user_profile(decoded: dict) -> dict:
 
 
 async def _upsert_user(profile: dict) -> dict:
+    """Crea l'utente al primo accesso o aggiorna i dati profilo."""
     uid = profile["uid"]
     now = datetime.now(timezone.utc)
     user = await db.users.find_one({"user_id": uid}, {"_id": 0})
@@ -386,7 +400,6 @@ def fmt_movie(m: dict) -> dict:
 
 def pick_trailer(videos: dict) -> Optional[str]:
     results = videos.get("results", []) if videos else []
-
     def score(v):
         if v.get("site") != "YouTube":
             return -1
@@ -398,7 +411,6 @@ def pick_trailer(videos: dict) -> Optional[str]:
         if v.get("official"):
             s += 3
         return s
-
     youtube = [v for v in results if v.get("site") == "YouTube" and v.get("key")]
     if not youtube:
         return None
@@ -419,7 +431,8 @@ def compute_overall(req: dict) -> Optional[float]:
     filled = [r for r in breakdown if r is not None]
     if not filled:
         return None
-    return round(sum(filled) / len(filled), 1)
+    avg = round(sum(filled) / len(filled), 1)
+    return avg
 
 
 PROVIDER_URLS = {
@@ -484,7 +497,7 @@ async def fetch_watch_providers(tmdb_id: int, title: str) -> list:
     return out
 
 
-# ===== Auth Routes =====
+# ===== Auth Routes (solo /me con auto-provisioning Firebase) =====
 @api_router.get("/auth/me")
 @limiter.limit("30/minute")
 async def auth_me(request: Request, user: dict = Depends(get_current_user)):
@@ -509,8 +522,8 @@ async def movies_popular(request: Request):
     data = await tmdb_get("/movie/popular", {"page": 1})
     return [fmt_movie(m) for m in data.get("results", [])[:20]]
 
-
 async def _search_actors(query: str, limit: int) -> list:
+    """Cerca persone su TMDB e ritorna solo attori/registi."""
     people = await tmdb_get("/search/person", {"query": query})
     results = []
     for p in people.get("results", [])[:limit]:
@@ -532,6 +545,7 @@ async def _search_actors(query: str, limit: int) -> list:
 
 
 async def _search_movies(query: str) -> list:
+    """Cerca film su TMDB, deduplicando per id."""
     movies = await tmdb_get("/search/movie", {"query": query})
     seen = set()
     out = []
@@ -564,7 +578,6 @@ async def movies_search(request: Request, query: str, kind: str = "auto"):
         "actors": actors_out[:20] if kind == "actor" else actors_out[:8],
         "movies": movies_out[:30],
     }
-
 
 @api_router.get("/movies/{tmdb_id}")
 @limiter.limit("60/minute")
@@ -600,6 +613,7 @@ async def movie_details(request: Request, tmdb_id: int):
 
 
 async def _resolve_biography(person: dict, person_id: int) -> str:
+    """Ritorna la bio in italiano, fallback inglese se vuota."""
     bio = (person.get("biography") or "").strip()
     if bio:
         return bio
@@ -611,6 +625,7 @@ async def _resolve_biography(person: dict, person_id: int) -> str:
 
 
 def _build_filmography(person: dict) -> list:
+    """Filtra, ordina per data e formatta la filmografia."""
     credits = person.get("movie_credits", {}) or {}
     films = [f for f in (credits.get("cast", []) or []) if f.get("release_date")]
     films.sort(key=lambda f: f.get("release_date", ""), reverse=True)
@@ -635,9 +650,9 @@ async def person_details(request: Request, person_id: int):
         "filmography": _build_filmography(person),
     }
 
-
 # ===== Quiz =====
 def _extract_quiz_context(details: dict) -> dict:
+    """Raccoglie tutti i metadati film necessari per il prompt LLM."""
     credits = details.get("credits", {}) or {}
     crew = credits.get("crew", []) or []
     return {
@@ -686,7 +701,7 @@ SINOSSI UFFICIALE:
 
 
 async def _call_llm_for_quiz(tmdb_id: int, prompt: str) -> str:
-    """Chiama direttamente l'API REST di Google Gemini (free tier)."""
+    """Chiama direttamente l'API REST di Google Gemini (zero dipendenze extra)."""
     if not GEMINI_API_KEY:
         raise HTTPException(status_code=500, detail="LLM non configurato")
     system_msg = (
@@ -728,6 +743,7 @@ async def _call_llm_for_quiz(tmdb_id: int, prompt: str) -> str:
 
 
 def _parse_llm_json(raw: str) -> dict:
+    """Estrae il JSON pulito dalla risposta LLM (anche con fence markdown)."""
     raw = (raw or "").strip()
     if raw.startswith("```"):
         raw = raw.strip("`").strip()
@@ -745,6 +761,7 @@ def _parse_llm_json(raw: str) -> dict:
 
 
 def _normalize_quiz_payload(parsed: dict, ctx: dict, tmdb_id: int) -> dict:
+    """Pulisce e valida la risposta LLM nel payload finale del quiz."""
     questions = []
     for q in (parsed.get("questions") or [])[:5]:
         questions.append({
@@ -840,7 +857,6 @@ async def movie_quiz(request: Request, tmdb_id: int):
     await _cache_quiz(tmdb_id, payload)
     return payload
 
-
 @api_router.get("/")
 async def root():
     return {"message": "CineDiario API", "status": "ok"}
@@ -848,12 +864,14 @@ async def root():
 
 app.include_router(api_router)
 
-# ===== Middleware (DOPO include_router) =====
+# ===== Middleware order matters: aggiungi DOPO include_router =====
+# In produzione restringi anche TrustedHost; in dev accetta *
 if ALLOWED_HOSTS and ALLOWED_HOSTS != ["*"]:
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
 
+# CORS: in produzione lista esplicita; mai allow_origins=["*"] insieme a credentials=True
 cors_origins = ALLOWED_ORIGINS if ALLOWED_ORIGINS else ["*"]
-cors_creds = bool(ALLOWED_ORIGINS)
+cors_creds = bool(ALLOWED_ORIGINS)  # credentials solo se hai una lista esplicita
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins,
@@ -867,6 +885,7 @@ app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(BodySizeLimitMiddleware)
 
 
+# ===== Global error handler: non leakkiamo stack in prod =====
 @app.exception_handler(Exception)
 async def unhandled_exception(request: Request, exc: Exception):
     logger.exception(f"Unhandled error on {request.method} {request.url.path}")
@@ -880,10 +899,8 @@ async def startup_db():
     await db.users.create_index("user_id", unique=True)
     await db.users.create_index("email", sparse=True)
     await db.users.create_index("friend_code", unique=True, sparse=True)
-    logger.info("CineDiario backend ready (Firebase Auth + MongoDB Atlas + Gemini)")
-
+    logger.info("CineDiario backend ready (Firebase Auth + MongoDB Atlas + Security hardened)")
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
     client.close()
-
