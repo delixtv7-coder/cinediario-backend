@@ -334,7 +334,7 @@ def _verify_firebase_token(id_token: str, client_ip: str) -> dict:
                 "iss": expected_iss,
                 "firebase": {"sign_in_provider": "uid_compat"},
             }
-         except firebase_auth.UserNotFoundError:
+        except firebase_auth.UserNotFoundError:
             security_logger.warning(
                 f"AUTH_FAIL unknown_uid ip={client_ip} "
                 f"uid_prefix={id_token[:8]} project={FIREBASE_PROJECT_ID}"
