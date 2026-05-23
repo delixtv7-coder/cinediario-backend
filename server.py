@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Header, Depends, Request, status
+from fastapi import FastAPI, APIRouter, HTTPException, Header, Depends, Request
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -9,7 +9,7 @@ import os
 import logging
 from pathlib import Path
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import Optional
 import uuid
 from datetime import datetime, timezone
 import httpx
@@ -23,9 +23,6 @@ from slowapi.errors import RateLimitExceeded
 # Firebase Admin SDK
 import firebase_admin
 from firebase_admin import credentials, auth as firebase_auth
-
-# Libreria UFFICIALE Google Gemini (indipendente)
-import google.generativeai as genai
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -44,12 +41,13 @@ client = AsyncIOMotorClient(
 )
 db = client[os.environ['DB_NAME']]
 
-# ===== TMDB / LLM config =====
+# ===== TMDB / Gemini config =====
 TMDB_TOKEN = os.environ['TMDB_TOKEN']
-EMERGENT_LLM_KEY = os.environ.get('EMERGENT_LLM_KEY', '')
-if EMERGENT_LLM_KEY:
-    genai.configure(api_key=EMERGENT_LLM_KEY)
-
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
+GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-2.5-flash')
+GEMINI_URL = (
+    f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+)
 TMDB_BASE = "https://api.themoviedb.org/3"
 TMDB_IMG = "https://image.tmdb.org/t/p/w500"
 TMDB_PROFILE_IMG = "https://image.tmdb.org/t/p/w185"
@@ -63,6 +61,7 @@ MAX_BODY_BYTES = int(os.environ.get('MAX_BODY_BYTES', 1_048_576))
 FIREBASE_PROJECT_ID = os.environ['FIREBASE_PROJECT_ID']
 APP_ENV = os.environ.get('APP_ENV', 'production').lower()
 IS_PROD = APP_ENV == 'production'
+
 
 # ===== Firebase Admin initialization =====
 def _init_firebase():
@@ -79,6 +78,7 @@ def _init_firebase():
         "token_uri": "https://oauth2.googleapis.com/token",
     })
     firebase_admin.initialize_app(cred, {"projectId": project_id})
+
 
 _init_firebase()
 
@@ -146,18 +146,21 @@ COUNTRY_IT = {
     "East Germany": "Germania Est",
 }
 
+
 def translate_country(name: str) -> str:
     if not name:
         return name
     return COUNTRY_IT.get(name, name)
 
 
-# ===== Rate limiter avanzato =====
+# ===== Rate limiter =====
 def _rate_key(request: Request) -> str:
+    """Rate limit per token se autenticato, altrimenti per IP."""
     auth = request.headers.get("authorization", "")
     if auth.startswith("Bearer ") and len(auth) > 20:
         return f"bearer:{auth[7:27]}"
     return get_remote_address(request)
+
 
 limiter = Limiter(key_func=_rate_key, default_limits=["120/minute"])
 
@@ -189,14 +192,12 @@ class BodySizeLimitMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         cl = request.headers.get("content-length")
         if cl and cl.isdigit() and int(cl) > MAX_BODY_BYTES:
-            return JSONResponse(
-                status_code=413,
-                content={"detail": "Payload troppo grande"},
-            )
+            return JSONResponse(status_code=413, content={"detail": "Payload troppo grande"})
         return await call_next(request)
 
 
 api_router = APIRouter(prefix="/api")
+
 
 # ===== Models =====
 class UserMovieReq(BaseModel):
@@ -209,6 +210,7 @@ class UserMovieReq(BaseModel):
     rating_screenplay: Optional[float] = None
     rating_soundtrack: Optional[float] = None
     rating_cinematography: Optional[float] = None
+
 
 class UpdateMovieReq(BaseModel):
     status: Optional[str] = None
@@ -351,6 +353,7 @@ async def get_current_user(
     request: Request,
     authorization: Optional[str] = Header(None),
 ) -> dict:
+    """Orchestratore auth: estrae token → verifica Firebase → upsert utente."""
     client_ip = get_remote_address(request)
     token = _extract_bearer_token(authorization, client_ip)
     decoded = _verify_firebase_token(token, client_ip)
@@ -383,6 +386,7 @@ def fmt_movie(m: dict) -> dict:
 
 def pick_trailer(videos: dict) -> Optional[str]:
     results = videos.get("results", []) if videos else []
+
     def score(v):
         if v.get("site") != "YouTube":
             return -1
@@ -394,6 +398,7 @@ def pick_trailer(videos: dict) -> Optional[str]:
         if v.get("official"):
             s += 3
         return s
+
     youtube = [v for v in results if v.get("site") == "YouTube" and v.get("key")]
     if not youtube:
         return None
@@ -681,17 +686,42 @@ SINOSSI UFFICIALE:
 
 
 async def _call_llm_for_quiz(tmdb_id: int, prompt: str) -> str:
-    if not EMERGENT_LLM_KEY:
+    """Chiama direttamente l'API REST di Google Gemini (free tier)."""
+    if not GEMINI_API_KEY:
         raise HTTPException(status_code=500, detail="LLM non configurato")
     system_msg = (
         "Sei un esperto di cinema italiano. Generi quiz a scelta multipla sulla TRAMA dei film. "
         "Rispondi SOLO con un oggetto JSON valido, senza markdown, senza testo prima o dopo."
     )
+    body = {
+        "systemInstruction": {"parts": [{"text": system_msg}]},
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.7,
+            "responseMimeType": "application/json",
+        },
+    }
     try:
-        # Codice ufficiale Google Gemini
-        model = genai.GenerativeModel('gemini-1.5-flash', system_instruction=system_msg)
-        response = await model.generate_content_async(prompt)
-        return response.text
+        async with httpx.AsyncClient(timeout=30.0) as c:
+            r = await c.post(
+                GEMINI_URL,
+                params={"key": GEMINI_API_KEY},
+                json=body,
+            )
+        if r.status_code != 200:
+            logger.error(f"Gemini API error tmdb_id={tmdb_id} status={r.status_code} body={r.text[:300]}")
+            raise HTTPException(status_code=502, detail="Impossibile generare il quiz")
+        data = r.json()
+        candidates = data.get("candidates") or []
+        if not candidates:
+            raise HTTPException(status_code=502, detail="Nessuna risposta dall'AI")
+        parts = (candidates[0].get("content") or {}).get("parts") or []
+        text = "".join(p.get("text", "") for p in parts)
+        if not text:
+            raise HTTPException(status_code=502, detail="Risposta AI vuota")
+        return text
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Gemini quiz generation failed for tmdb_id={tmdb_id}: {e}")
         raise HTTPException(status_code=502, detail="Impossibile generare il quiz")
@@ -818,7 +848,7 @@ async def root():
 
 app.include_router(api_router)
 
-# ===== Middleware (ordine: aggiungi DOPO include_router) =====
+# ===== Middleware (DOPO include_router) =====
 if ALLOWED_HOSTS and ALLOWED_HOSTS != ["*"]:
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
 
@@ -850,7 +880,7 @@ async def startup_db():
     await db.users.create_index("user_id", unique=True)
     await db.users.create_index("email", sparse=True)
     await db.users.create_index("friend_code", unique=True, sparse=True)
-    logger.info("CineDiario backend ready (Firebase Auth + MongoDB Atlas + Security hardened)")
+    logger.info("CineDiario backend ready (Firebase Auth + MongoDB Atlas + Gemini)")
 
 
 @app.on_event("shutdown")
