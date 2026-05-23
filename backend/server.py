@@ -432,7 +432,6 @@ async def _movie_snapshot(tmdb_id: int) -> dict:
         return {"tmdb_id": tmdb_id, "title": "", "poster_url": None}
 
 def _serialize_user_movie(doc: dict) -> dict:
-    # IL FIX E' QUI: Estrarre locandina e titolo dalla sottocartella movie per farle leggere all'app!
     movie_obj = doc.get("movie") or {}
     return {
         "tmdb_id": doc["tmdb_id"],
@@ -528,6 +527,10 @@ async def delete_user_movie(request: Request, tmdb_id: int, user: dict = Depends
         raise HTTPException(status_code=404, detail="Film non presente nel diario")
     return {"ok": True}
 
+
+# ==========================================
+# IL FIX DEL PROFILO È QUI (rating_distribution)
+# ==========================================
 @api_router.get("/user/stats")
 @limiter.limit("30/minute")
 async def user_stats(request: Request, user: dict = Depends(get_current_user)):
@@ -539,15 +542,29 @@ async def user_stats(request: Request, user: dict = Depends(get_current_user)):
             "avg_rating": {"$avg": "$overall"},
         }},
     ]
+    
+    # Questo mancava e mandava in crash profile.tsx!
+    dist_pipeline = [
+        {"$match": {"user_id": user["user_id"], "status": "watched", "overall": {"$exists": True, "$ne": None}}},
+        {"$group": {"_id": "$overall", "count": {"$sum": 1}}},
+    ]
+    
     by_status = {}
     total = 0
     sum_minutes = 0
+    
     async for row in db.user_movies.aggregate(pipeline):
         by_status[row["_id"] or "unknown"] = {
             "count": row["count"],
             "avg_rating": round(row["avg_rating"], 2) if row["avg_rating"] else None,
         }
         total += row["count"]
+        
+    rating_dist = {}
+    async for row in db.user_movies.aggregate(dist_pipeline):
+        if row["_id"] is not None:
+            rating_dist[str(int(row["_id"]))] = row["count"]
+
     runtime_cursor = db.user_movies.find(
         {"user_id": user["user_id"], "status": "watched"},
         {"_id": 0, "movie.runtime": 1},
@@ -556,13 +573,13 @@ async def user_stats(request: Request, user: dict = Depends(get_current_user)):
         rt = ((d.get("movie") or {}).get("runtime")) or 0
         sum_minutes += rt
         
-    # IL FIX E' QUI: Modificato l'output per combaciare esattamente con la richiesta dell'app
     return {
         "total_watched": by_status.get("watched", {}).get("count", 0),
         "total_watchlist": by_status.get("watchlist", {}).get("count", 0),
         "average_rating": by_status.get("watched", {}).get("avg_rating"),
         "total": total,
         "by_status": by_status,
+        "rating_distribution": rating_dist, # <--- IL DATO CHE IL PROFILO CERCAVA
         "watched_minutes": sum_minutes,
         "watched_hours": round(sum_minutes / 60, 1),
     }
@@ -781,13 +798,17 @@ async def mark_share_read(request: Request, share_id: str, user: dict = Depends(
         raise HTTPException(status_code=404, detail="Condivisione non trovata")
     return {"ok": True}
 
-# ===== AI MOVIE FINDER =====
+
+# ==========================================
+# IL FIX DELL' AI DISCOVER È QUI
+# Ho inserito entrambi i nomi delle rotte
+# ==========================================
 class MovieFinderReq(BaseModel):
     answers: dict
     free_text: Optional[str] = None
 
-# IL FIX E' QUI: Rotta rinominata per combaciare perfettamente con l'app
 @api_router.post("/discover/ai-recommend")
+@api_router.post("/ai/movie-finder") 
 @limiter.limit("15/minute")
 async def ai_movie_finder(request: Request, req: MovieFinderReq, user: dict = Depends(get_current_user)):
     if not GEMINI_API_KEY:
@@ -1137,6 +1158,10 @@ async def _cache_quiz(tmdb_id: int, payload: dict) -> None:
     except Exception:
         pass
 
+
+# ==========================================
+# IL FIX DEI QUIZ È QUI (fallback trama in inglese)
+# ==========================================
 @api_router.get("/quiz/{tmdb_id}")
 @limiter.limit("20/minute")
 async def movie_quiz(request: Request, tmdb_id: int):
@@ -1154,7 +1179,8 @@ async def movie_quiz(request: Request, tmdb_id: int):
 
     ctx = _extract_quiz_context(details)
     
-    # IL FIX E' QUI: Se la trama in italiano non esiste, la scarica in inglese per far lavorare Gemini
+    # TRUCCHETTO AI: Se la trama in italiano non esiste, la scarica in inglese 
+    # così Gemini ha qualcosa da leggere per generare il quiz
     if not ctx["overview"] or len(ctx["overview"]) < 30:
         try:
             en_details = await tmdb_get(f"/movie/{tmdb_id}", {"language": "en-US", "append_to_response": "credits,keywords"})
@@ -1217,4 +1243,3 @@ async def startup_db():
 @app.on_event("shutdown")
 async def shutdown_db_client():
     client.close()
-    
