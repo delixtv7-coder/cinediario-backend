@@ -33,7 +33,6 @@ security_logger = logging.getLogger("cinediario.security")
 
 # ===== MongoDB connection (MongoDB Atlas) =====
 mongo_url = os.environ['MONGO_URL']
-# tls=true è raccomandato per Atlas, ma "mongodb+srv://" lo abilita già di default
 client = AsyncIOMotorClient(
     mongo_url,
     serverSelectionTimeoutMS=8000,
@@ -56,21 +55,14 @@ TMDB_HEADERS = {"Authorization": f"Bearer {TMDB_TOKEN}", "accept": "application/
 TMDB_LANG = "it-IT"
 
 # ===== Security config (da env) =====
-# Lista di origini autorizzate per il CORS (es. il tuo dominio Expo Web, app mobili usano scheme custom)
-# Esempio: ALLOWED_ORIGINS="https://cinediario.app,https://www.cinediario.app"
 ALLOWED_ORIGINS = [o.strip() for o in os.environ.get('ALLOWED_ORIGINS', '').split(',') if o.strip()]
-# Lista di host accettati a livello HTTP (proteggi da Host header injection)
-# Esempio: ALLOWED_HOSTS="cinediario-api.onrender.com"
 ALLOWED_HOSTS = [h.strip() for h in os.environ.get('ALLOWED_HOSTS', '*').split(',') if h.strip()]
-# Limite size body in bytes (default 1 MB)
 MAX_BODY_BYTES = int(os.environ.get('MAX_BODY_BYTES', 1_048_576))
-# Project ID Firebase: usato anche per validare audience/issuer del token
 FIREBASE_PROJECT_ID = os.environ['FIREBASE_PROJECT_ID']
-# Ambiente: in "production" non leakkiamo dettagli errori
 APP_ENV = os.environ.get('APP_ENV', 'production').lower()
 IS_PROD = APP_ENV == 'production'
 
-# ===== Firebase Admin initialization (credenziali da variabili d'ambiente) =====
+# ===== Firebase Admin initialization =====
 def _init_firebase():
     if firebase_admin._apps:
         return
@@ -88,82 +80,11 @@ def _init_firebase():
 
 _init_firebase()
 
-COUNTRY_IT = {
-    "United States of America": "Stati Uniti",
-    "United Kingdom": "Regno Unito",
-    "France": "Francia",
-    "Germany": "Germania",
-    "Italy": "Italia",
-    "Spain": "Spagna",
-    "Japan": "Giappone",
-    "China": "Cina",
-    "South Korea": "Corea del Sud",
-    "Korea, South": "Corea del Sud",
-    "India": "India",
-    "Canada": "Canada",
-    "Australia": "Australia",
-    "New Zealand": "Nuova Zelanda",
-    "Brazil": "Brasile",
-    "Argentina": "Argentina",
-    "Mexico": "Messico",
-    "Russia": "Russia",
-    "Soviet Union": "Unione Sovietica",
-    "Sweden": "Svezia",
-    "Norway": "Norvegia",
-    "Denmark": "Danimarca",
-    "Finland": "Finlandia",
-    "Iceland": "Islanda",
-    "Belgium": "Belgio",
-    "Netherlands": "Paesi Bassi",
-    "Switzerland": "Svizzera",
-    "Austria": "Austria",
-    "Ireland": "Irlanda",
-    "Portugal": "Portogallo",
-    "Greece": "Grecia",
-    "Turkey": "Turchia",
-    "Poland": "Polonia",
-    "Czech Republic": "Repubblica Ceca",
-    "Hungary": "Ungheria",
-    "Romania": "Romania",
-    "Bulgaria": "Bulgaria",
-    "Israel": "Israele",
-    "Iran": "Iran",
-    "Egypt": "Egitto",
-    "South Africa": "Sudafrica",
-    "Hong Kong": "Hong Kong",
-    "Taiwan": "Taiwan",
-    "Thailand": "Thailandia",
-    "Vietnam": "Vietnam",
-    "Indonesia": "Indonesia",
-    "Philippines": "Filippine",
-    "Malaysia": "Malesia",
-    "Singapore": "Singapore",
-    "United Arab Emirates": "Emirati Arabi Uniti",
-    "Saudi Arabia": "Arabia Saudita",
-    "Chile": "Cile",
-    "Colombia": "Colombia",
-    "Peru": "Perù",
-    "Cuba": "Cuba",
-    "Ukraine": "Ucraina",
-    "Croatia": "Croazia",
-    "Serbia": "Serbia",
-    "Yugoslavia": "Jugoslavia",
-    "West Germany": "Germania Ovest",
-    "East Germany": "Germania Est",
-}
-
-def translate_country(name: str) -> str:
-    if not name:
-        return name
-    return COUNTRY_IT.get(name, name)
-
-
 # ===== Rate limiter avanzato =====
 def _rate_key(request: Request) -> str:
-    """Rate limit per UID se autenticato, altrimenti per IP."""
     auth = request.headers.get("authorization", "")
     if auth.startswith("Bearer ") and len(auth) > 20:
-        return f"bearer:{auth[7:27]}"  # primi 20 char del token come fingerprint
+        return f"bearer:{auth[7:27]}"
     return get_remote_address(request)
 
 limiter = Limiter(key_func=_rate_key, default_limits=["120/minute"])
@@ -177,7 +98,6 @@ app = FastAPI(
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-
 # ===== Security middlewares =====
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
@@ -187,14 +107,12 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
         response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
-        # CSP base: l'API non serve HTML, quindi blocchiamo qualsiasi risorsa
         response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'"
         try:
             del response.headers["Server"]
         except KeyError:
             pass
         return response
-
 
 class BodySizeLimitMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
@@ -205,7 +123,6 @@ class BodySizeLimitMiddleware(BaseHTTPMiddleware):
                 content={"detail": "Payload troppo grande"},
             )
         return await call_next(request)
-
 
 api_router = APIRouter(prefix="/api")
 
@@ -231,7 +148,6 @@ class UpdateMovieReq(BaseModel):
     rating_soundtrack: Optional[float] = None
     rating_cinematography: Optional[float] = None
 
-
 # ===== Helpers =====
 def serialize_user(user: dict) -> dict:
     return {
@@ -243,13 +159,10 @@ def serialize_user(user: dict) -> dict:
         "friend_code": user.get("friend_code"),
     }
 
-
 def _generate_friend_code() -> str:
-    """Genera codice amico cripto-sicuro (non più `random`)."""
     alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     suffix = "".join(secrets.choice(alphabet) for _ in range(6))
     return f"CIN-{suffix}"
-
 
 async def ensure_friend_code(user: dict) -> str:
     code = user.get("friend_code")
@@ -266,16 +179,11 @@ async def ensure_friend_code(user: dict) -> str:
             user["friend_code"] = candidate
             return candidate
     fallback = f"CIN-{uuid.uuid4().hex[:6].upper()}"
-    await db.users.update_one(
-        {"user_id": user["user_id"]},
-        {"$set": {"friend_code": fallback}},
-    )
+    await db.users.update_one({"user_id": user["user_id"]}, {"$set": {"friend_code": fallback}})
     user["friend_code"] = fallback
     return fallback
 
-
 def _extract_bearer_token(authorization: Optional[str], client_ip: str) -> str:
-    """Estrae e valida la presenza dell'header Bearer."""
     if not authorization or not authorization.startswith("Bearer "):
         security_logger.warning(f"AUTH_FAIL missing_token ip={client_ip}")
         raise HTTPException(status_code=401, detail="Missing token")
@@ -285,25 +193,14 @@ def _extract_bearer_token(authorization: Optional[str], client_ip: str) -> str:
         raise HTTPException(status_code=401, detail="Invalid token")
     return token
 
-
 def _verify_firebase_token(id_token: str, client_ip: str) -> dict:
-    """
-    Tenta prima la verifica come ID Token Firebase completo (sicuro).
-    Se fallisce, prova come UID Firebase puro: valida tramite Firebase Admin
-    che l'UID esista realmente (modalità compat per app che mandano user.uid
-    invece di user.getIdToken()).
-    """
     expected_iss = f"https://securetoken.google.com/{FIREBASE_PROJECT_ID}"
-
-    # --- Tentativo 1: Firebase ID Token (JWT lungo con 2 punti) ---
     if "." in id_token and len(id_token) > 100:
         try:
             decoded = firebase_auth.verify_id_token(id_token, check_revoked=True)
             if decoded.get("aud") == FIREBASE_PROJECT_ID and decoded.get("iss") == expected_iss:
                 return decoded
-            security_logger.warning(
-                f"AUTH_FAIL wrong_project ip={client_ip} aud={decoded.get('aud')}"
-            )
+            security_logger.warning(f"AUTH_FAIL wrong_project ip={client_ip} aud={decoded.get('aud')}")
             raise HTTPException(status_code=401, detail="Token not for this project")
         except firebase_auth.RevokedIdTokenError:
             security_logger.warning(f"AUTH_FAIL revoked_token ip={client_ip}")
@@ -316,11 +213,10 @@ def _verify_firebase_token(id_token: str, client_ip: str) -> dict:
         except HTTPException:
             raise
         except firebase_auth.InvalidIdTokenError:
-            pass  # cade al tentativo UID
+            pass 
         except Exception as e:
             security_logger.error(f"AUTH_FAIL verify_error ip={client_ip} err={e}")
 
-    # --- Tentativo 2: UID Firebase puro (modalità compat) ---
     if 10 <= len(id_token) <= 200 and all(c.isalnum() or c in "-_" for c in id_token):
         try:
             ur = firebase_auth.get_user(id_token)
@@ -335,22 +231,14 @@ def _verify_firebase_token(id_token: str, client_ip: str) -> dict:
                 "firebase": {"sign_in_provider": "uid_compat"},
             }
         except firebase_auth.UserNotFoundError:
-            security_logger.warning(
-                f"AUTH_FAIL unknown_uid ip={client_ip} "
-                f"uid_prefix={id_token[:8]} project={FIREBASE_PROJECT_ID}"
-            )
+            security_logger.warning(f"AUTH_FAIL unknown_uid ip={client_ip} uid_prefix={id_token[:8]}")
         except Exception as e:
             security_logger.error(f"AUTH_FAIL uid_lookup_error ip={client_ip} err={e}")
 
-    security_logger.warning(
-        f"AUTH_FAIL invalid_token ip={client_ip} "
-        f"len={len(id_token)} prefix={id_token[:20]} "
-        f"project_expected={FIREBASE_PROJECT_ID}"
-    )
+    security_logger.warning(f"AUTH_FAIL invalid_token ip={client_ip} len={len(id_token)} prefix={id_token[:20]}")
     raise HTTPException(status_code=401, detail="Invalid Firebase token")
 
 def _build_user_profile(decoded: dict) -> dict:
-    """Estrae i dati profilo dal token decodificato Firebase."""
     uid = decoded.get("uid") or decoded.get("user_id")
     if not uid:
         raise HTTPException(status_code=401, detail="UID mancante nel token")
@@ -364,9 +252,7 @@ def _build_user_profile(decoded: dict) -> dict:
         "provider_id": decoded.get("firebase", {}).get("sign_in_provider"),
     }
 
-
 async def _upsert_user(profile: dict) -> dict:
-    """Crea l'utente al primo accesso o aggiorna i dati profilo."""
     uid = profile["uid"]
     now = datetime.now(timezone.utc)
     user = await db.users.find_one({"user_id": uid}, {"_id": 0})
@@ -397,18 +283,12 @@ async def _upsert_user(profile: dict) -> dict:
     await ensure_friend_code(user)
     return user
 
-
-async def get_current_user(
-    request: Request,
-    authorization: Optional[str] = Header(None),
-) -> dict:
-    """Orchestratore auth: estrae token → verifica Firebase → upsert utente."""
+async def get_current_user(request: Request, authorization: Optional[str] = Header(None)) -> dict:
     client_ip = get_remote_address(request)
     token = _extract_bearer_token(authorization, client_ip)
     decoded = _verify_firebase_token(token, client_ip)
     profile = _build_user_profile(decoded)
     return await _upsert_user(profile)
-
 
 async def tmdb_get(path: str, params: dict = None) -> dict:
     p = {"language": TMDB_LANG}
@@ -420,7 +300,6 @@ async def tmdb_get(path: str, params: dict = None) -> dict:
             raise HTTPException(status_code=502, detail=f"TMDB error: {r.status_code}")
         return r.json()
 
-
 def fmt_movie(m: dict) -> dict:
     return {
         "tmdb_id": m["id"],
@@ -431,7 +310,6 @@ def fmt_movie(m: dict) -> dict:
         "release_date": m.get("release_date"),
         "vote_average": m.get("vote_average", 0),
     }
-
 
 def pick_trailer(videos: dict) -> Optional[str]:
     results = videos.get("results", []) if videos else []
@@ -452,7 +330,6 @@ def pick_trailer(videos: dict) -> Optional[str]:
     best = max(youtube, key=score)
     return f"https://www.youtube.com/watch?v={best['key']}"
 
-
 def compute_overall(req: dict) -> Optional[float]:
     if req.get("rating") is not None:
         return req.get("rating")
@@ -468,7 +345,6 @@ def compute_overall(req: dict) -> Optional[float]:
         return None
     avg = round(sum(filled) / len(filled), 1)
     return avg
-
 
 PROVIDER_URLS = {
     8:   "https://www.netflix.com/search?q={q}",
@@ -491,13 +367,11 @@ PROVIDER_URLS = {
     1899: "https://play.max.com/search?q={q}",
 }
 
-
 def build_provider_url(provider_id: int, title: str, fallback_link: Optional[str]) -> str:
     template = PROVIDER_URLS.get(provider_id)
     if template:
         return template.format(q=quote_plus(title))
     return fallback_link or f"https://www.google.com/search?q={quote_plus(title)}+streaming"
-
 
 async def fetch_watch_providers(tmdb_id: int, title: str) -> list:
     try:
@@ -531,23 +405,16 @@ async def fetch_watch_providers(tmdb_id: int, title: str) -> list:
             })
     return out
 
-
-# ===== Auth Routes (solo /me con auto-provisioning Firebase) =====
+# ===== Auth Routes =====
 @api_router.get("/auth/me")
 @limiter.limit("30/minute")
 async def auth_me(request: Request, user: dict = Depends(get_current_user)):
     return {"user": serialize_user(user)}
 
-
-# ===========================================================
-# ===== USER MOVIES (diario personale: watched/watchlist/etc)
-# ===========================================================
-
+# ===== USER MOVIES =====
 VALID_STATUSES = {"watched", "watchlist", "favorite", "watching"}
 
-
 async def _movie_snapshot(tmdb_id: int) -> dict:
-    """Snapshot leggero del film da TMDB per salvarlo nel diario."""
     try:
         details = await tmdb_get(f"/movie/{tmdb_id}")
         return {
@@ -564,32 +431,31 @@ async def _movie_snapshot(tmdb_id: int) -> dict:
     except Exception:
         return {"tmdb_id": tmdb_id, "title": "", "poster_url": None}
 
-
 def _serialize_user_movie(doc: dict) -> dict:
+    # IL FIX E' QUI: Estrarre locandina e titolo dalla sottocartella movie per farle leggere all'app!
+    movie_obj = doc.get("movie") or {}
     return {
         "tmdb_id": doc["tmdb_id"],
         "status": doc.get("status"),
         "rating": doc.get("rating"),
         "overall": doc.get("overall"),
+        "title": movie_obj.get("title", ""),
+        "poster_url": movie_obj.get("poster_url"),
+        "backdrop_url": movie_obj.get("backdrop_url"),
         "notes": doc.get("notes"),
         "rating_directing": doc.get("rating_directing"),
         "rating_acting": doc.get("rating_acting"),
         "rating_screenplay": doc.get("rating_screenplay"),
         "rating_soundtrack": doc.get("rating_soundtrack"),
         "rating_cinematography": doc.get("rating_cinematography"),
-        "movie": doc.get("movie") or {"tmdb_id": doc["tmdb_id"]},
+        "movie": movie_obj,
         "created_at": (doc.get("created_at") or datetime.now(timezone.utc)).isoformat(),
         "updated_at": (doc.get("updated_at") or datetime.now(timezone.utc)).isoformat(),
     }
 
-
 @api_router.get("/user/movies")
 @limiter.limit("60/minute")
-async def list_user_movies(
-    request: Request,
-    status: Optional[str] = None,
-    user: dict = Depends(get_current_user),
-):
+async def list_user_movies(request: Request, status: Optional[str] = None, user: dict = Depends(get_current_user)):
     query = {"user_id": user["user_id"]}
     if status:
         if status not in VALID_STATUSES:
@@ -598,29 +464,17 @@ async def list_user_movies(
     cursor = db.user_movies.find(query, {"_id": 0}).sort("updated_at", -1).limit(500)
     return [_serialize_user_movie(d) async for d in cursor]
 
-
 @api_router.get("/user/movies/{tmdb_id}")
 @limiter.limit("60/minute")
-async def get_user_movie(
-    request: Request,
-    tmdb_id: int,
-    user: dict = Depends(get_current_user),
-):
-    doc = await db.user_movies.find_one(
-        {"user_id": user["user_id"], "tmdb_id": tmdb_id}, {"_id": 0}
-    )
+async def get_user_movie(request: Request, tmdb_id: int, user: dict = Depends(get_current_user)):
+    doc = await db.user_movies.find_one({"user_id": user["user_id"], "tmdb_id": tmdb_id}, {"_id": 0})
     if not doc:
         raise HTTPException(status_code=404, detail="Film non presente nel diario")
     return _serialize_user_movie(doc)
 
-
 @api_router.post("/user/movies")
 @limiter.limit("30/minute")
-async def upsert_user_movie(
-    request: Request,
-    req: UserMovieReq,
-    user: dict = Depends(get_current_user),
-):
+async def upsert_user_movie(request: Request, req: UserMovieReq, user: dict = Depends(get_current_user)):
     if req.status not in VALID_STATUSES:
         raise HTTPException(status_code=400, detail="status non valido")
     snapshot = await _movie_snapshot(req.tmdb_id)
@@ -647,23 +501,13 @@ async def upsert_user_movie(
         {"$set": update, "$setOnInsert": {"created_at": now}},
         upsert=True,
     )
-    doc = await db.user_movies.find_one(
-        {"user_id": user["user_id"], "tmdb_id": req.tmdb_id}, {"_id": 0}
-    )
+    doc = await db.user_movies.find_one({"user_id": user["user_id"], "tmdb_id": req.tmdb_id}, {"_id": 0})
     return _serialize_user_movie(doc)
-
 
 @api_router.patch("/user/movies/{tmdb_id}")
 @limiter.limit("30/minute")
-async def update_user_movie(
-    request: Request,
-    tmdb_id: int,
-    req: UpdateMovieReq,
-    user: dict = Depends(get_current_user),
-):
-    existing = await db.user_movies.find_one(
-        {"user_id": user["user_id"], "tmdb_id": tmdb_id}
-    )
+async def update_user_movie(request: Request, tmdb_id: int, req: UpdateMovieReq, user: dict = Depends(get_current_user)):
+    existing = await db.user_movies.find_one({"user_id": user["user_id"], "tmdb_id": tmdb_id})
     if not existing:
         raise HTTPException(status_code=404, detail="Film non presente nel diario")
     updates = {k: v for k, v in req.model_dump().items() if v is not None}
@@ -672,30 +516,17 @@ async def update_user_movie(
     merged = {**existing, **updates}
     updates["overall"] = compute_overall(merged)
     updates["updated_at"] = datetime.now(timezone.utc)
-    await db.user_movies.update_one(
-        {"user_id": user["user_id"], "tmdb_id": tmdb_id},
-        {"$set": updates},
-    )
-    doc = await db.user_movies.find_one(
-        {"user_id": user["user_id"], "tmdb_id": tmdb_id}, {"_id": 0}
-    )
+    await db.user_movies.update_one({"user_id": user["user_id"], "tmdb_id": tmdb_id}, {"$set": updates})
+    doc = await db.user_movies.find_one({"user_id": user["user_id"], "tmdb_id": tmdb_id}, {"_id": 0})
     return _serialize_user_movie(doc)
-
 
 @api_router.delete("/user/movies/{tmdb_id}")
 @limiter.limit("30/minute")
-async def delete_user_movie(
-    request: Request,
-    tmdb_id: int,
-    user: dict = Depends(get_current_user),
-):
-    result = await db.user_movies.delete_one(
-        {"user_id": user["user_id"], "tmdb_id": tmdb_id}
-    )
+async def delete_user_movie(request: Request, tmdb_id: int, user: dict = Depends(get_current_user)):
+    result = await db.user_movies.delete_one({"user_id": user["user_id"], "tmdb_id": tmdb_id})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Film non presente nel diario")
     return {"ok": True}
-
 
 @api_router.get("/user/stats")
 @limiter.limit("30/minute")
@@ -724,18 +555,21 @@ async def user_stats(request: Request, user: dict = Depends(get_current_user)):
     async for d in runtime_cursor:
         rt = ((d.get("movie") or {}).get("runtime")) or 0
         sum_minutes += rt
+        
+    # IL FIX E' QUI: Modificato l'output per combaciare esattamente con la richiesta dell'app
     return {
+        "total_watched": by_status.get("watched", {}).get("count", 0),
+        "total_watchlist": by_status.get("watchlist", {}).get("count", 0),
+        "average_rating": by_status.get("watched", {}).get("avg_rating"),
         "total": total,
         "by_status": by_status,
         "watched_minutes": sum_minutes,
         "watched_hours": round(sum_minutes / 60, 1),
     }
 
-
 @api_router.get("/user/recommendations")
 @limiter.limit("20/minute")
 async def user_recommendations(request: Request, user: dict = Depends(get_current_user)):
-    """Consiglia film TMDB simili agli ultimi 3 watched di voto >=4. Fallback: popular."""
     cursor = db.user_movies.find(
         {"user_id": user["user_id"], "status": "watched", "overall": {"$gte": 4}},
         {"_id": 0, "tmdb_id": 1},
@@ -749,7 +583,7 @@ async def user_recommendations(request: Request, user: dict = Depends(get_curren
     if not seeds:
         data = await tmdb_get("/movie/popular", {"page": 1})
         recs = [fmt_movie(m) for m in data.get("results", []) if m.get("id") not in already_ids]
-        return recs[:20]
+        return {"recommendations": recs[:20], "message": "Vota qualche film per ricevere consigli personalizzati!"}
 
     out = []
     seen = set()
@@ -763,21 +597,15 @@ async def user_recommendations(request: Request, user: dict = Depends(get_curren
             if mid and mid not in seen and mid not in already_ids:
                 seen.add(mid)
                 out.append(fmt_movie(m))
-    return out[:20]
+    return {"recommendations": out[:20]}
 
-
-# ===========================================================
-# ===== FRIENDS (richieste amicizia, lista amici)
-# ===========================================================
-
+# ===== FRIENDS =====
 def _friendship_key(a: str, b: str) -> dict:
     lo, hi = sorted([a, b])
     return {"user_lo": lo, "user_hi": hi}
 
-
 def _other_user(fr: dict, me: str) -> str:
     return fr["user_hi"] if fr["user_lo"] == me else fr["user_lo"]
-
 
 async def _friend_profile(user_id: str) -> dict:
     other = await db.users.find_one(
@@ -785,7 +613,6 @@ async def _friend_profile(user_id: str) -> dict:
         {"_id": 0, "user_id": 1, "name": 1, "picture": 1, "friend_code": 1},
     )
     return other or {"user_id": user_id, "name": "Utente", "picture": None, "friend_code": None}
-
 
 @api_router.get("/friends")
 @limiter.limit("60/minute")
@@ -799,7 +626,6 @@ async def list_friends(request: Request, user: dict = Depends(get_current_user))
     async for fr in cursor:
         out.append(await _friend_profile(_other_user(fr, me)))
     return out
-
 
 @api_router.get("/friends/requests")
 @limiter.limit("60/minute")
@@ -823,18 +649,12 @@ async def list_friend_requests(request: Request, user: dict = Depends(get_curren
             incoming.append(entry)
     return {"incoming": incoming, "outgoing": outgoing}
 
-
 class FriendRequestReq(BaseModel):
     friend_code: str
 
-
 @api_router.post("/friends/requests")
 @limiter.limit("10/minute")
-async def send_friend_request(
-    request: Request,
-    req: FriendRequestReq,
-    user: dict = Depends(get_current_user),
-):
+async def send_friend_request(request: Request, req: FriendRequestReq, user: dict = Depends(get_current_user)):
     code = req.friend_code.strip().upper()
     if not code:
         raise HTTPException(status_code=400, detail="Codice amico mancante")
@@ -859,14 +679,9 @@ async def send_friend_request(
     })
     return {"ok": True, "request_id": request_id, "to": await _friend_profile(target["user_id"])}
 
-
 @api_router.post("/friends/requests/{request_id}/accept")
 @limiter.limit("30/minute")
-async def accept_friend_request(
-    request: Request,
-    request_id: str,
-    user: dict = Depends(get_current_user),
-):
+async def accept_friend_request(request: Request, request_id: str, user: dict = Depends(get_current_user)):
     fr = await db.friendships.find_one({"request_id": request_id, "status": "pending"})
     if not fr:
         raise HTTPException(status_code=404, detail="Richiesta non trovata")
@@ -879,14 +694,9 @@ async def accept_friend_request(
     )
     return {"ok": True, "friend": await _friend_profile(_other_user(fr, me))}
 
-
 @api_router.post("/friends/requests/{request_id}/decline")
 @limiter.limit("30/minute")
-async def decline_friend_request(
-    request: Request,
-    request_id: str,
-    user: dict = Depends(get_current_user),
-):
+async def decline_friend_request(request: Request, request_id: str, user: dict = Depends(get_current_user)):
     fr = await db.friendships.find_one({"request_id": request_id, "status": "pending"})
     if not fr:
         raise HTTPException(status_code=404, detail="Richiesta non trovata")
@@ -896,52 +706,36 @@ async def decline_friend_request(
     await db.friendships.delete_one({"request_id": request_id})
     return {"ok": True}
 
-
 @api_router.delete("/friends/{friend_user_id}")
 @limiter.limit("30/minute")
-async def remove_friend(
-    request: Request,
-    friend_user_id: str,
-    user: dict = Depends(get_current_user),
-):
+async def remove_friend(request: Request, friend_user_id: str, user: dict = Depends(get_current_user)):
     key = _friendship_key(user["user_id"], friend_user_id)
     result = await db.friendships.delete_one({**key, "status": "accepted"})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Amicizia non trovata")
     return {"ok": True}
 
-
-# ===========================================================
-# ===== SHARES (condivisione film tra amici, posta in arrivo)
-# ===========================================================
-
+# ===== SHARES =====
 class ShareReq(BaseModel):
     to_user_id: str
     tmdb_id: int
     message: Optional[str] = None
-
 
 async def _are_friends(a: str, b: str) -> bool:
     key = _friendship_key(a, b)
     fr = await db.friendships.find_one({**key, "status": "accepted"})
     return fr is not None
 
-
 @api_router.get("/shares/unread-count")
 @limiter.limit("120/minute")
 async def shares_unread_count(request: Request, user: dict = Depends(get_current_user)):
-    count = await db.shares.count_documents(
-        {"to_user_id": user["user_id"], "read": False}
-    )
+    count = await db.shares.count_documents({"to_user_id": user["user_id"], "read": False})
     return {"count": count}
-
 
 @api_router.get("/shares/inbox")
 @limiter.limit("60/minute")
 async def shares_inbox(request: Request, user: dict = Depends(get_current_user)):
-    cursor = db.shares.find(
-        {"to_user_id": user["user_id"]}, {"_id": 0}
-    ).sort("created_at", -1).limit(100)
+    cursor = db.shares.find({"to_user_id": user["user_id"]}, {"_id": 0}).sort("created_at", -1).limit(100)
     out = []
     async for s in cursor:
         out.append({
@@ -955,14 +749,9 @@ async def shares_inbox(request: Request, user: dict = Depends(get_current_user))
         })
     return out
 
-
 @api_router.post("/shares")
 @limiter.limit("20/minute")
-async def create_share(
-    request: Request,
-    req: ShareReq,
-    user: dict = Depends(get_current_user),
-):
+async def create_share(request: Request, req: ShareReq, user: dict = Depends(get_current_user)):
     if req.to_user_id == user["user_id"]:
         raise HTTPException(status_code=400, detail="Non puoi condividere con te stesso")
     if not await _are_friends(user["user_id"], req.to_user_id):
@@ -981,14 +770,9 @@ async def create_share(
     })
     return {"ok": True, "share_id": share_id}
 
-
 @api_router.post("/shares/{share_id}/read")
 @limiter.limit("60/minute")
-async def mark_share_read(
-    request: Request,
-    share_id: str,
-    user: dict = Depends(get_current_user),
-):
+async def mark_share_read(request: Request, share_id: str, user: dict = Depends(get_current_user)):
     result = await db.shares.update_one(
         {"share_id": share_id, "to_user_id": user["user_id"]},
         {"$set": {"read": True, "read_at": datetime.now(timezone.utc)}},
@@ -997,27 +781,17 @@ async def mark_share_read(
         raise HTTPException(status_code=404, detail="Condivisione non trovata")
     return {"ok": True}
 
-
-# ===========================================================
-# ===== AI MOVIE FINDER (suggerisce 7 film tramite domande)
-# ===========================================================
-
+# ===== AI MOVIE FINDER =====
 class MovieFinderReq(BaseModel):
-    answers: dict  # es. {"mood": "leggero", "genre": "azione", ...}
+    answers: dict
     free_text: Optional[str] = None
 
-
-@api_router.post("/ai/movie-finder")
+# IL FIX E' QUI: Rotta rinominata per combaciare perfettamente con l'app
+@api_router.post("/discover/ai-recommend")
 @limiter.limit("15/minute")
-async def ai_movie_finder(
-    request: Request,
-    req: MovieFinderReq,
-    user: dict = Depends(get_current_user),
-):
-    """Riceve risposte/preferenze utente, chiede a Gemini titoli di 7 film e li cerca su TMDB."""
+async def ai_movie_finder(request: Request, req: MovieFinderReq, user: dict = Depends(get_current_user)):
     if not GEMINI_API_KEY:
         raise HTTPException(status_code=500, detail="LLM non configurato")
-    # Costruisci prompt
     answer_lines = []
     for k, v in (req.answers or {}).items():
         if v is None or v == "":
@@ -1036,9 +810,7 @@ Esattamente 7 film, in italiano, vari per stile ma coerenti con le risposte.
 Non aggiungere testo prima o dopo il JSON, non usare markdown."""
 
     body = {
-        "systemInstruction": {"parts": [{
-            "text": "Sei un esperto cinefilo italiano. Consigli film esistenti reali, mai inventati. Rispondi solo JSON."
-        }]},
+        "systemInstruction": {"parts": [{"text": "Sei un esperto cinefilo italiano. Consigli film esistenti reali, mai inventati. Rispondi solo JSON."}]},
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.8, "responseMimeType": "application/json"},
     }
@@ -1046,7 +818,6 @@ Non aggiungere testo prima o dopo il JSON, non usare markdown."""
         async with httpx.AsyncClient(timeout=30.0) as c:
             r = await c.post(GEMINI_URL, params={"key": GEMINI_API_KEY}, json=body)
         if r.status_code != 200:
-            logger.error(f"Gemini finder error status={r.status_code} body={r.text[:300]}")
             raise HTTPException(status_code=502, detail="Impossibile generare consigli")
         data = r.json()
         candidates = data.get("candidates") or []
@@ -1057,7 +828,6 @@ Non aggiungere testo prima o dopo il JSON, non usare markdown."""
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"AI finder failed: {e}")
         raise HTTPException(status_code=502, detail="Errore durante la generazione dei consigli")
 
     suggestions = (parsed.get("movies") or [])[:7]
@@ -1067,7 +837,6 @@ Non aggiungere testo prima o dopo il JSON, non usare markdown."""
         year = s.get("year")
         if not title:
             continue
-        # Cerca su TMDB per recuperare poster e id reale
         try:
             params = {"query": title}
             if year:
@@ -1076,26 +845,16 @@ Non aggiungere testo prima o dopo il JSON, non usare markdown."""
             results = search.get("results") or []
             if results:
                 m = results[0]
-                out.append({
-                    **fmt_movie(m),
-                    "why": (s.get("why") or "").strip(),
-                })
+                out.append({**fmt_movie(m), "why": (s.get("why") or "").strip()})
             else:
-                # Nessun match: ritorna almeno titolo e motivo
                 out.append({
-                    "tmdb_id": None,
-                    "title": title,
-                    "poster_url": None,
-                    "backdrop_url": None,
-                    "release_date": f"{year}-01-01" if year else None,
-                    "overview": None,
-                    "vote_average": 0,
+                    "tmdb_id": None, "title": title, "poster_url": None, "backdrop_url": None,
+                    "release_date": f"{year}-01-01" if year else None, "overview": None, "vote_average": 0,
                     "why": (s.get("why") or "").strip(),
                 })
         except Exception:
             continue
     return {"movies": out}
-
 
 # ===== Health =====
 @api_router.get("/health")
@@ -1106,64 +865,9 @@ async def health():
     except Exception:
         mongo_ok = False
     return {
-        "status": "ok",
-        "mongo": mongo_ok,
-        "firebase": bool(firebase_admin._apps),
-        "firebase_project_id": FIREBASE_PROJECT_ID,
+        "status": "ok", "mongo": mongo_ok,
+        "firebase": bool(firebase_admin._apps), "firebase_project_id": FIREBASE_PROJECT_ID,
     }
-
-
-# ===== Debug whoami (diagnosi problemi auth) =====
-@api_router.get("/debug/whoami")
-async def debug_whoami(authorization: Optional[str] = Header(None)):
-    """Mostra esattamente cosa il backend vede dal token. Da rimuovere in produzione."""
-    out = {
-        "expected_project_id": FIREBASE_PROJECT_ID,
-        "has_authorization_header": bool(authorization),
-    }
-    if not authorization or not authorization.startswith("Bearer "):
-        out["error"] = "Missing or malformed Authorization header"
-        return out
-    token = authorization[7:].strip()
-    out["token_length"] = len(token)
-    out["token_prefix"] = token[:30]
-    out["token_suffix"] = token[-10:] if len(token) > 10 else ""
-    out["looks_like_jwt"] = "." in token and len(token) > 100
-
-    if out["looks_like_jwt"]:
-        try:
-            decoded = firebase_auth.verify_id_token(token, check_revoked=False)
-            out["id_token_decoded"] = {
-                "uid": decoded.get("uid"),
-                "email": decoded.get("email"),
-                "aud": decoded.get("aud"),
-                "iss": decoded.get("iss"),
-                "project_match": decoded.get("aud") == FIREBASE_PROJECT_ID,
-            }
-            return out
-        except Exception as e:
-            out["id_token_error"] = f"{type(e).__name__}: {str(e)[:200]}"
-
-    try:
-        ur = firebase_auth.get_user(token)
-        out["uid_lookup"] = {
-            "found": True,
-            "uid": ur.uid,
-            "email": ur.email,
-            "display_name": ur.display_name,
-        }
-    except firebase_auth.UserNotFoundError:
-        out["uid_lookup"] = {
-            "found": False,
-            "hint": (
-                f"L'UID '{token[:12]}...' NON esiste nel progetto Firebase "
-                f"'{FIREBASE_PROJECT_ID}'. Verifica che il FIREBASE_PROJECT_ID "
-                f"di Render corrisponda al projectId del Firebase usato dal frontend."
-            ),
-        }
-    except Exception as e:
-        out["uid_lookup"] = {"error": f"{type(e).__name__}: {str(e)[:200]}"}
-    return out
 
 # ===== TMDB Routes =====
 @api_router.get("/movies/popular")
@@ -1173,7 +877,6 @@ async def movies_popular(request: Request):
     return [fmt_movie(m) for m in data.get("results", [])[:20]]
 
 async def _search_actors(query: str, limit: int) -> list:
-    """Cerca persone su TMDB e ritorna solo attori/registi."""
     people = await tmdb_get("/search/person", {"query": query})
     results = []
     for p in people.get("results", [])[:limit]:
@@ -1185,17 +888,11 @@ async def _search_actors(query: str, limit: int) -> list:
             "name": p.get("name"),
             "profile_url": f"{TMDB_PROFILE_IMG}{p['profile_path']}" if p.get("profile_path") else None,
             "known_for_department": dept,
-            "known_for": [
-                k.get("title") or k.get("name")
-                for k in p.get("known_for", [])[:3]
-                if k.get("title") or k.get("name")
-            ],
+            "known_for": [k.get("title") or k.get("name") for k in p.get("known_for", [])[:3] if k.get("title") or k.get("name")],
         })
     return results
 
-
 async def _search_movies(query: str) -> list:
-    """Cerca film su TMDB, deduplicando per id."""
     movies = await tmdb_get("/search/movie", {"query": query})
     seen = set()
     out = []
@@ -1205,7 +902,6 @@ async def _search_movies(query: str) -> list:
             seen.add(mid)
             out.append(fmt_movie(m))
     return out
-
 
 @api_router.get("/movies/search")
 @limiter.limit("30/minute")
@@ -1238,9 +934,7 @@ async def movie_details(request: Request, tmdb_id: int):
     credits = details.get("credits", {})
     cast = [
         {
-            "id": c["id"],
-            "name": c.get("name"),
-            "character": c.get("character"),
+            "id": c["id"], "name": c.get("name"), "character": c.get("character"),
             "profile_url": f"{TMDB_PROFILE_IMG}{c['profile_path']}" if c.get("profile_path") else None,
         }
         for c in credits.get("cast", [])[:15]
@@ -1261,9 +955,7 @@ async def movie_details(request: Request, tmdb_id: int):
         "providers": providers,
     }
 
-
 async def _resolve_biography(person: dict, person_id: int) -> str:
-    """Ritorna la bio in italiano, fallback inglese se vuota."""
     bio = (person.get("biography") or "").strip()
     if bio:
         return bio
@@ -1273,14 +965,11 @@ async def _resolve_biography(person: dict, person_id: int) -> str:
     except Exception:
         return ""
 
-
 def _build_filmography(person: dict) -> list:
-    """Filtra, ordina per data e formatta la filmografia."""
     credits = person.get("movie_credits", {}) or {}
     films = [f for f in (credits.get("cast", []) or []) if f.get("release_date")]
     films.sort(key=lambda f: f.get("release_date", ""), reverse=True)
     return [{**fmt_movie(f), "character": f.get("character")} for f in films[:40]]
-
 
 @api_router.get("/people/{person_id}")
 @limiter.limit("60/minute")
@@ -1302,7 +991,6 @@ async def person_details(request: Request, person_id: int):
 
 # ===== Quiz =====
 def _extract_quiz_context(details: dict) -> dict:
-    """Raccoglie tutti i metadati film necessari per il prompt LLM."""
     credits = details.get("credits", {}) or {}
     crew = credits.get("crew", []) or []
     return {
@@ -1313,15 +1001,10 @@ def _extract_quiz_context(details: dict) -> dict:
         "overview": (details.get("overview") or "").strip(),
         "tagline": (details.get("tagline") or "").strip(),
         "genres": [g.get("name") for g in details.get("genres", []) if g.get("name")],
-        "keywords": [
-            k.get("name")
-            for k in (details.get("keywords", {}) or {}).get("keywords", [])[:8]
-            if k.get("name")
-        ],
+        "keywords": [k.get("name") for k in (details.get("keywords", {}) or {}).get("keywords", [])[:8] if k.get("name")],
         "cast": credits.get("cast", []) or [],
         "poster_url": f"{TMDB_IMG}{details['poster_path']}" if details.get("poster_path") else None,
     }
-
 
 def _format_cast_block(cast: list) -> str:
     lines = []
@@ -1332,7 +1015,6 @@ def _format_cast_block(cast: list) -> str:
         elif nm:
             lines.append(f"- {nm}")
     return "\n".join(lines) if lines else "(non disponibile)"
-
 
 def _build_quiz_prompt(ctx: dict) -> str:
     return f"""Genera un quiz e un riassunto chiave per il film:
@@ -1349,9 +1031,7 @@ SINOSSI UFFICIALE:
 {ctx['overview']}
 """
 
-
 async def _call_llm_for_quiz(tmdb_id: int, prompt: str) -> str:
-    """Chiama direttamente l'API REST di Google Gemini (zero dipendenze extra)."""
     if not GEMINI_API_KEY:
         raise HTTPException(status_code=500, detail="LLM non configurato")
     system_msg = (
@@ -1361,20 +1041,12 @@ async def _call_llm_for_quiz(tmdb_id: int, prompt: str) -> str:
     body = {
         "systemInstruction": {"parts": [{"text": system_msg}]},
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.7,
-            "responseMimeType": "application/json",
-        },
+        "generationConfig": {"temperature": 0.7, "responseMimeType": "application/json"},
     }
     try:
         async with httpx.AsyncClient(timeout=30.0) as c:
-            r = await c.post(
-                GEMINI_URL,
-                params={"key": GEMINI_API_KEY},
-                json=body,
-            )
+            r = await c.post(GEMINI_URL, params={"key": GEMINI_API_KEY}, json=body)
         if r.status_code != 200:
-            logger.error(f"Gemini API error tmdb_id={tmdb_id} status={r.status_code} body={r.text[:300]}")
             raise HTTPException(status_code=502, detail="Impossibile generare il quiz")
         data = r.json()
         candidates = data.get("candidates") or []
@@ -1388,12 +1060,9 @@ async def _call_llm_for_quiz(tmdb_id: int, prompt: str) -> str:
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Gemini quiz generation failed for tmdb_id={tmdb_id}: {e}")
         raise HTTPException(status_code=502, detail="Impossibile generare il quiz")
 
-
 def _parse_llm_json(raw: str) -> dict:
-    """Estrae il JSON pulito dalla risposta LLM (anche con fence markdown)."""
     raw = (raw or "").strip()
     if raw.startswith("```"):
         raw = raw.strip("`").strip()
@@ -1409,9 +1078,7 @@ def _parse_llm_json(raw: str) -> dict:
         except Exception:
             raise HTTPException(status_code=502, detail="Risposta AI non valida")
 
-
 def _normalize_quiz_payload(parsed: dict, ctx: dict, tmdb_id: int) -> dict:
-    """Pulisce e valida la risposta LLM nel payload finale del quiz."""
     questions = []
     for q in (parsed.get("questions") or [])[:5]:
         questions.append({
@@ -1443,25 +1110,17 @@ def _normalize_quiz_payload(parsed: dict, ctx: dict, tmdb_id: int) -> dict:
         "ai_generated": True,
     }
 
-
 def _empty_quiz_payload(ctx: dict, tmdb_id: int) -> dict:
     return {
-        "tmdb_id": tmdb_id,
-        "title": ctx["title"],
-        "poster_url": ctx["poster_url"],
-        "tagline": ctx["tagline"],
-        "questions": [],
+        "tmdb_id": tmdb_id, "title": ctx["title"], "poster_url": ctx["poster_url"],
+        "tagline": ctx["tagline"], "questions": [],
         "recap": {
             "intro": f"Trama di «{ctx['title']}» non disponibile in italiano su TMDB.",
-            "plot": "",
-            "characters": [],
-            "key_moments": [],
-            "themes": [],
+            "plot": "", "characters": [], "key_moments": [], "themes": [],
             "outro": ctx["tagline"] or "",
         },
         "ai_generated": False,
     }
-
 
 async def _cache_quiz(tmdb_id: int, payload: dict) -> None:
     if not payload.get("questions") or not payload["recap"].get("plot"):
@@ -1470,17 +1129,13 @@ async def _cache_quiz(tmdb_id: int, payload: dict) -> None:
         await db.movie_quizzes.update_one(
             {"tmdb_id": tmdb_id, "lang": "it"},
             {"$set": {
-                "tmdb_id": tmdb_id,
-                "lang": "it",
-                "version": 2,
-                "payload": payload,
-                "generated_at": datetime.now(timezone.utc),
+                "tmdb_id": tmdb_id, "lang": "it", "version": 2,
+                "payload": payload, "generated_at": datetime.now(timezone.utc),
             }},
             upsert=True,
         )
     except Exception:
         pass
-
 
 @api_router.get("/quiz/{tmdb_id}")
 @limiter.limit("20/minute")
@@ -1498,6 +1153,15 @@ async def movie_quiz(request: Request, tmdb_id: int):
         raise HTTPException(status_code=404, detail="Film non trovato")
 
     ctx = _extract_quiz_context(details)
+    
+    # IL FIX E' QUI: Se la trama in italiano non esiste, la scarica in inglese per far lavorare Gemini
+    if not ctx["overview"] or len(ctx["overview"]) < 30:
+        try:
+            en_details = await tmdb_get(f"/movie/{tmdb_id}", {"language": "en-US", "append_to_response": "credits,keywords"})
+            ctx["overview"] = _extract_quiz_context(en_details).get("overview", "")
+        except Exception:
+            pass
+            
     if not ctx["overview"] or len(ctx["overview"]) < 30:
         return _empty_quiz_payload(ctx, tmdb_id)
 
@@ -1511,17 +1175,13 @@ async def movie_quiz(request: Request, tmdb_id: int):
 async def root():
     return {"message": "CineDiario API", "status": "ok"}
 
-
 app.include_router(api_router)
 
-# ===== Middleware order matters: aggiungi DOPO include_router =====
-# In produzione restringi anche TrustedHost; in dev accetta *
 if ALLOWED_HOSTS and ALLOWED_HOSTS != ["*"]:
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
 
-# CORS: in produzione lista esplicita; mai allow_origins=["*"] insieme a credentials=True
 cors_origins = ALLOWED_ORIGINS if ALLOWED_ORIGINS else ["*"]
-cors_creds = bool(ALLOWED_ORIGINS)  # credentials solo se hai una lista esplicita
+cors_creds = bool(ALLOWED_ORIGINS) 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins,
@@ -1534,15 +1194,12 @@ app.add_middleware(
 app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(BodySizeLimitMiddleware)
 
-
-# ===== Global error handler: non leakkiamo stack in prod =====
 @app.exception_handler(Exception)
 async def unhandled_exception(request: Request, exc: Exception):
     logger.exception(f"Unhandled error on {request.method} {request.url.path}")
     if IS_PROD:
         return JSONResponse(status_code=500, content={"detail": "Internal server error"})
     return JSONResponse(status_code=500, content={"detail": f"{type(exc).__name__}: {exc}"})
-
 
 @app.on_event("startup")
 async def startup_db():
