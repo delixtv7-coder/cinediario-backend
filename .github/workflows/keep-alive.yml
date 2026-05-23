@@ -1,0 +1,30 @@
+name: Keep Render Backend Awake
+
+# Pinga /api/health ogni 10 minuti per evitare lo sleep di Render Free.
+# Costo: ~5 secondi a run × 6 run/ora × 24h × 30gg = ~360 min/mese
+# (i 2000 min gratuiti GitHub Actions sono ampiamente sufficienti).
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'   # ogni 10 minuti
+  workflow_dispatch:          # permette anche l'avvio manuale dalla UI
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Ping backend health endpoint
+        run: |
+          echo "Pinging $BACKEND_URL/api/health ..."
+          STATUS=$(curl -s -o /tmp/body.txt -w "%{http_code}" --max-time 60 "$BACKEND_URL/api/health" || echo "000")
+          echo "HTTP Status: $STATUS"
+          cat /tmp/body.txt || true
+          # Non falliamo il workflow se il backend è temporaneamente lento (cold start)
+          if [ "$STATUS" = "200" ]; then
+            echo "Backend awake."
+          else
+            echo "Backend not responding with 200, but workflow continues."
+          fi
+        env:
+          BACKEND_URL: ${{ secrets.BACKEND_URL }}
