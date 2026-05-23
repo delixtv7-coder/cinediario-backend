@@ -334,14 +334,20 @@ def _verify_firebase_token(id_token: str, client_ip: str) -> dict:
                 "iss": expected_iss,
                 "firebase": {"sign_in_provider": "uid_compat"},
             }
-        except firebase_auth.UserNotFoundError:
-            security_logger.warning(f"AUTH_FAIL unknown_uid ip={client_ip}")
+         except firebase_auth.UserNotFoundError:
+            security_logger.warning(
+                f"AUTH_FAIL unknown_uid ip={client_ip} "
+                f"uid_prefix={id_token[:8]} project={FIREBASE_PROJECT_ID}"
+            )
         except Exception as e:
             security_logger.error(f"AUTH_FAIL uid_lookup_error ip={client_ip} err={e}")
 
-    security_logger.warning(f"AUTH_FAIL invalid_token ip={client_ip}")
+    security_logger.warning(
+        f"AUTH_FAIL invalid_token ip={client_ip} "
+        f"len={len(id_token)} prefix={id_token[:20]} "
+        f"project_expected={FIREBASE_PROJECT_ID}"
+    )
     raise HTTPException(status_code=401, detail="Invalid Firebase token")
-
 
 def _build_user_profile(decoded: dict) -> dict:
     """Estrae i dati profilo dal token decodificato Firebase."""
@@ -1099,8 +1105,65 @@ async def health():
         mongo_ok = True
     except Exception:
         mongo_ok = False
-    return {"status": "ok", "mongo": mongo_ok, "firebase": bool(firebase_admin._apps)}
+    return {
+        "status": "ok",
+        "mongo": mongo_ok,
+        "firebase": bool(firebase_admin._apps),
+        "firebase_project_id": FIREBASE_PROJECT_ID,
+    }
 
+
+# ===== Debug whoami (diagnosi problemi auth) =====
+@api_router.get("/debug/whoami")
+async def debug_whoami(authorization: Optional[str] = Header(None)):
+    """Mostra esattamente cosa il backend vede dal token. Da rimuovere in produzione."""
+    out = {
+        "expected_project_id": FIREBASE_PROJECT_ID,
+        "has_authorization_header": bool(authorization),
+    }
+    if not authorization or not authorization.startswith("Bearer "):
+        out["error"] = "Missing or malformed Authorization header"
+        return out
+    token = authorization[7:].strip()
+    out["token_length"] = len(token)
+    out["token_prefix"] = token[:30]
+    out["token_suffix"] = token[-10:] if len(token) > 10 else ""
+    out["looks_like_jwt"] = "." in token and len(token) > 100
+
+    if out["looks_like_jwt"]:
+        try:
+            decoded = firebase_auth.verify_id_token(token, check_revoked=False)
+            out["id_token_decoded"] = {
+                "uid": decoded.get("uid"),
+                "email": decoded.get("email"),
+                "aud": decoded.get("aud"),
+                "iss": decoded.get("iss"),
+                "project_match": decoded.get("aud") == FIREBASE_PROJECT_ID,
+            }
+            return out
+        except Exception as e:
+            out["id_token_error"] = f"{type(e).__name__}: {str(e)[:200]}"
+
+    try:
+        ur = firebase_auth.get_user(token)
+        out["uid_lookup"] = {
+            "found": True,
+            "uid": ur.uid,
+            "email": ur.email,
+            "display_name": ur.display_name,
+        }
+    except firebase_auth.UserNotFoundError:
+        out["uid_lookup"] = {
+            "found": False,
+            "hint": (
+                f"L'UID '{token[:12]}...' NON esiste nel progetto Firebase "
+                f"'{FIREBASE_PROJECT_ID}'. Verifica che il FIREBASE_PROJECT_ID "
+                f"di Render corrisponda al projectId del Firebase usato dal frontend."
+            ),
+        }
+    except Exception as e:
+        out["uid_lookup"] = {"error": f"{type(e).__name__}: {str(e)[:200]}"}
+    return out
 
 # ===== TMDB Routes =====
 @api_router.get("/movies/popular")
