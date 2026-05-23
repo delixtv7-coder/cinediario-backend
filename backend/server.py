@@ -510,14 +510,13 @@ async def update_user_movie(request: Request, tmdb_id: int, req: UpdateMovieReq,
     if not existing:
         raise HTTPException(status_code=404, detail="Film non presente nel diario")
     updates = {k: v for k, v in req.model_dump().items() if v is not None}
+    if "status" in updates and updates["status"] not in VALID_STATUSES:
+        raise HTTPException(status_code=400, detail="status non valido")
     merged = {**existing, **updates}
     updates["overall"] = compute_overall(merged)
     updates["updated_at"] = datetime.now(timezone.utc)
     
-    # -------------------------------------------------------------
-    # AUTO-GUARIGIONE COPERTINE: Se un vecchio film non ha la foto o il titolo, lo scarica in automatico!
-    # Questo risolve il problema dei "riquadri grigi" quando si aggiorna il voto.
-    # -------------------------------------------------------------
+    # Auto-guarigione copertine per film vecchi
     if not existing.get("movie") or not existing.get("movie", {}).get("poster_url"):
         updates["movie"] = await _movie_snapshot(tmdb_id)
         
@@ -559,15 +558,11 @@ async def user_stats(request: Request, user: dict = Depends(get_current_user)):
         }
         total += row["count"]
         
-    # -------------------------------------------------------------
-    # SICUREZZA GRAFICO PROFILO: Non crasha più se inserisci un voto come "8.5"
-    # -------------------------------------------------------------
     rating_dist = {}
     async for row in db.user_movies.aggregate(dist_pipeline):
         val = row.get("_id")
         if val is not None:
             try:
-                # Converte in sicurezza il decimale in numero intero per il grafico
                 bucket = str(int(float(val)))
                 rating_dist[bucket] = rating_dist.get(bucket, 0) + row.get("count", 0)
             except (ValueError, TypeError):
@@ -1041,8 +1036,11 @@ def _format_cast_block(cast: list) -> str:
             lines.append(f"- {nm}")
     return "\n".join(lines) if lines else "(non disponibile)"
 
+
+# IL FIX DELLE ISTRUZIONI DI EMERGENT È QUI
 def _build_quiz_prompt(ctx: dict) -> str:
     return f"""Genera un quiz e un riassunto chiave per il film:
+
 TITOLO ITALIANO: {ctx['title']}
 TITOLO ORIGINALE: {ctx['original_title']}
 ANNO: {ctx['year'] or 'sconosciuto'}
@@ -1054,13 +1052,50 @@ CAST PRINCIPALE:
 {_format_cast_block(ctx['cast'])}
 SINOSSI UFFICIALE:
 {ctx['overview']}
+
+ISTRUZIONI:
+1. Genera ESATTAMENTE 5 domande a scelta multipla (4 opzioni ciascuna) sulla TRAMA, sui PERSONAGGI e su quello che ACCADE nel film.
+   - NON fare domande su: anno di uscita, durata, regista, paese di produzione, premi, incassi.
+   - SI a domande tipo: motivazioni dei personaggi, conflitti, scelte morali, eventi chiave, finale, relazioni tra personaggi, ambientazione narrativa, oggetti/luoghi simbolici.
+   - Le domande devono essere CHIARE e RISOLVIBILI da chi ha visto il film (anche tempo fa).
+   - I distrattori devono essere PLAUSIBILI ma chiaramente SBAGLIATI per chi ricorda il film.
+   - Lingua: italiano, tono naturale.
+
+2. Genera un RIASSUNTO CHIAVE strutturato per aiutare lo spettatore a ricordare il film:
+   - "plot": un riassunto narrativo di 4-6 frasi che ripercorre inizio, sviluppo, climax e finale.
+   - "characters": 3-5 personaggi principali con 1 frase ciascuno (nome personaggio + ruolo nella storia).
+   - "key_moments": 3-5 scene/momenti chiave da ricordare (frasi brevi e vivide).
+   - "themes": 2-4 temi principali del film.
+
+FORMATO DI RISPOSTA (JSON ESATTO):
+{{
+  "questions": [
+    {{
+      "question": "...",
+      "options": ["a", "b", "c", "d"],
+      "correct_index": 0,
+      "explanation": "breve spiegazione del perché è la risposta giusta (1 frase)"
+    }}
+  ],
+  "recap": {{
+    "plot": "...",
+    "characters": [
+      {{"name": "Nome Personaggio", "role": "ruolo nella storia in una frase"}}
+    ],
+    "key_moments": ["momento 1", "momento 2"],
+    "themes": ["tema 1", "tema 2"]
+  }}
+}}
+
+Restituisci SOLO l'oggetto JSON valido.
 """
 
 async def _call_llm_for_quiz(tmdb_id: int, prompt: str) -> str:
     if not GEMINI_API_KEY:
         raise HTTPException(status_code=500, detail="LLM non configurato")
     system_msg = (
-        "Sei un esperto di cinema italiano. Generi quiz a scelta multipla sulla TRAMA dei film. "
+        "Sei un esperto di cinema italiano. Generi quiz a scelta multipla sulla TRAMA dei film "
+        "(NON su anno, regista, durata o paese di produzione) e brevi riassunti narrativi in italiano. "
         "Rispondi SOLO con un oggetto JSON valido, senza markdown, senza testo prima o dopo."
     )
     body = {
@@ -1179,10 +1214,7 @@ async def movie_quiz(request: Request, tmdb_id: int):
 
     ctx = _extract_quiz_context(details)
     
-    # -----------------------------------------------------------------
-    # IL PIANO B DEI QUIZ: Se la trama in italiano non esiste (o è < 30 char)
-    # scarica la trama in inglese!
-    # -----------------------------------------------------------------
+    # IL PIANO B: Trama in inglese se manca l'italiano
     if not ctx.get("overview") or len(ctx["overview"]) < 30:
         try:
             en_details = await tmdb_get(f"/movie/{tmdb_id}", {"language": "en-US"})
