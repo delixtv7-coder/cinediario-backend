@@ -724,29 +724,41 @@ class FriendRequestReq(BaseModel):
 @limiter.limit("10/minute")
 async def send_friend_request(request: Request, req: FriendRequestReq, user: dict = Depends(get_current_user)):
     code = req.friend_code.strip().upper()
-    if not code:
-        raise HTTPException(status_code=400, detail="Codice amico mancante")
-    target = await db.users.find_one({"friend_code": code}, {"_id": 0})
+    
+    # 1. Recupero utente target
+    target = await db.users.find_one({"friend_code": code})
     if not target:
         raise HTTPException(status_code=404, detail="Codice amico non trovato")
-    if target["user_id"] == user["user_id"]:
+    
+    target_id = target["user_id"]
+    if target_id == user["user_id"]:
         raise HTTPException(status_code=400, detail="Non puoi aggiungere te stesso")
-    key = _friendship_key(user["user_id"], target["user_id"])
-    existing = await db.friendships.find_one(key)
+
+    # 2. Controllo amicizia esistente
+    user_lo, user_hi = (user["user_id"], target_id) if user["user_id"] < target_id else (target_id, user["user_id"])
+    existing = await db.friendships.find_one({"user_lo": user_lo, "user_hi": user_hi})
+    
     if existing:
-        if existing.get("status") == "accepted":
-            raise HTTPException(status_code=400, detail="Siete già amici")
-        raise HTTPException(status_code=400, detail="Richiesta già in corso")
+        raise HTTPException(status_code=400, detail="Relazione già esistente")
+
+    # 3. Inserimento nel database
     request_id = f"fr_{uuid.uuid4().hex[:12]}"
     await db.friendships.insert_one({
-        **key,
+        "user_lo": user_lo,
+        "user_hi": user_hi,
         "request_id": request_id,
         "requested_by": user["user_id"],
         "status": "pending",
         "created_at": datetime.now(timezone.utc),
     })
-    return {"ok": True, "request_id": request_id, "to": await _friend_profile(target["user_id"])}
-
+    
+    # 4. Recupero profilo in modo sicuro
+    profile = await _friend_profile(target_id)
+    
+    # Se il profilo è None, restituiamo un oggetto di fallback invece di crashare
+    safe_profile = profile if profile else {"name": "Utente", "user_id": target_id}
+        
+    return {"ok": True, "request_id": request_id, "to": safe_profile}
 @api_router.post("/friends/requests/{request_id}/accept")
 @limiter.limit("30/minute")
 async def accept_friend_request(request: Request, request_id: str, user: dict = Depends(get_current_user)):
