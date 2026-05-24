@@ -156,8 +156,10 @@ class UpdateMovieReq(BaseModel):
 # e il banner per registrarsi nel Profilo.
 # -------------------------------------------------------------
 def serialize_user(user: dict) -> dict:
-    # Aggiunto di nuovo il controllo vitale per l'Ospite
-    is_guest = user.get("auth_provider_id") == "anonymous" or user.get("auth_provider") == "guest"
+    # Controlliamo in modo più robusto se l'utente è un ospite anonimo di Firebase
+    provider_id = user.get("auth_provider_id")
+    is_guest = provider_id == "anonymous" or provider_id is None or user.get("auth_provider") == "guest"
+    
     return {
         "user_id": user["user_id"],
         "email": user.get("email", ""),
@@ -286,6 +288,8 @@ async def _upsert_user(profile: dict) -> dict:
             "last_login_at": now,
         }
         try:
+            # Generiamo il friend code SUBITO prima di inserire il nuovo utente
+            await ensure_friend_code(user)
             await db.users.insert_one(user)
             security_logger.info(f"AUTH_NEW_USER uid={uid} provider={profile.get('provider_id')}")
         except Exception:
@@ -293,8 +297,6 @@ async def _upsert_user(profile: dict) -> dict:
     else:
         updates = {"last_login_at": now}
         
-        # 🔥 FIX: AGGIORNIAMO IL PROVIDER SE L'UTENTE SI È REGISTRATO DA OSPITE!
-        # Questo toglie definitivamente il "lucchetto" e fa apparire il codice amico.
         if profile.get("provider_id") and user.get("auth_provider_id") != profile["provider_id"]:
             updates["auth_provider_id"] = profile["provider_id"]
 
@@ -302,10 +304,13 @@ async def _upsert_user(profile: dict) -> dict:
             if profile.get(key) and user.get(key) != profile[key]:
                 updates[key] = profile[key]
                 
+        # Ci assicuriamo che l'utente ESISTENTE abbia un codice amico
+        await ensure_friend_code(user)
+        updates["friend_code"] = user["friend_code"]
+                
         await db.users.update_one({"user_id": uid}, {"$set": updates})
         user.update(updates)
         
-    await ensure_friend_code(user)
     return user
 
 async def get_current_user(request: Request, authorization: Optional[str] = Header(None)) -> dict:
