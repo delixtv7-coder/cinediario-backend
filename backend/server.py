@@ -156,13 +156,14 @@ class UpdateMovieReq(BaseModel):
 # e il banner per registrarsi nel Profilo.
 # -------------------------------------------------------------
 def serialize_user(user: dict) -> dict:
+    # Aggiunto di nuovo il controllo vitale per l'Ospite
     is_guest = user.get("auth_provider_id") == "anonymous" or user.get("auth_provider") == "guest"
     return {
         "user_id": user["user_id"],
         "email": user.get("email", ""),
         "name": user.get("name", ""),
         "picture": user.get("picture"),
-        "is_guest": is_guest,  
+        "is_guest": is_guest,
         "friend_code": user.get("friend_code"),
     }
 
