@@ -706,15 +706,21 @@ async def list_friend_requests(request: Request, user: dict = Depends(get_curren
     )
     async for fr in cursor:
         other_profile = await _friend_profile(_other_user(fr, me))
+        
+        # FIX: Costruiamo la risposta usando gli ESATTI nomi che friends.tsx si aspetta!
         entry = {
-            "id": fr.get("request_id"),
-            "user": other_profile,
+            "request_id": fr.get("request_id"),
             "created_at": (fr.get("created_at") or datetime.now(timezone.utc)).isoformat(),
         }
+        
+        # Separiamo chi invia e chi riceve, proprio come vuole il frontend
         if fr.get("requested_by") == me:
+            entry["to_user"] = other_profile
             outgoing.append(entry)
         else:
+            entry["from_user"] = other_profile
             incoming.append(entry)
+            
     return {"incoming": incoming, "outgoing": outgoing}
 
 class FriendRequestReq(BaseModel):
@@ -765,15 +771,22 @@ async def accept_friend_request(request: Request, request_id: str, user: dict = 
     fr = await db.friendships.find_one({"request_id": request_id, "status": "pending"})
     if not fr:
         raise HTTPException(status_code=404, detail="Richiesta non trovata")
+    
     me = user["user_id"]
     if me not in (fr["user_lo"], fr["user_hi"]) or fr.get("requested_by") == me:
         raise HTTPException(status_code=403, detail="Non puoi accettare questa richiesta")
+    
     await db.friendships.update_one(
         {"request_id": request_id},
         {"$set": {"status": "accepted", "accepted_at": datetime.now(timezone.utc)}},
     )
-    return {"ok": True, "friend": await _friend_profile(_other_user(fr, me))}
-
+    
+    # LO SCUDO ANTI-CRASH:
+    other_id = _other_user(fr, me)
+    profile = await _friend_profile(other_id)
+    safe_profile = profile if profile else {"name": "Utente", "user_id": other_id}
+    
+    return {"ok": True, "friend": safe_profile}
 @api_router.post("/friends/requests/{request_id}/decline")
 @limiter.limit("30/minute")
 async def decline_friend_request(request: Request, request_id: str, user: dict = Depends(get_current_user)):
