@@ -225,9 +225,18 @@ def _verify_firebase_token(id_token: str, client_ip: str) -> dict:
         except Exception as e:
             security_logger.error(f"AUTH_FAIL verify_error ip={client_ip} err={e}")
 
+    # FIX: Se stiamo usando il fallback tramite UID
     if 10 <= len(id_token) <= 200 and all(c.isalnum() or c in "-_" for c in id_token):
         try:
             ur = firebase_auth.get_user(id_token)
+            
+            # 🔥 FIX: Determiniamo il VERO provider dell'utente
+            # Se provider_data è vuoto, è un utente anonimo (ospite).
+            # Altrimenti prendiamo il provider reale (es. "password", "google.com")
+            sign_in_provider = "anonymous"
+            if ur.provider_data:
+                sign_in_provider = ur.provider_data[0].provider_id
+
             return {
                 "uid": ur.uid,
                 "email": (ur.email or "").lower(),
@@ -236,7 +245,7 @@ def _verify_firebase_token(id_token: str, client_ip: str) -> dict:
                 "picture": ur.photo_url,
                 "aud": FIREBASE_PROJECT_ID,
                 "iss": expected_iss,
-                "firebase": {"sign_in_provider": "uid_compat"},
+                "firebase": {"sign_in_provider": sign_in_provider}, # Salviamo quello reale, NON "uid_compat"
             }
         except firebase_auth.UserNotFoundError:
             security_logger.warning(f"AUTH_FAIL unknown_uid ip={client_ip} uid_prefix={id_token[:8]}")
@@ -245,7 +254,6 @@ def _verify_firebase_token(id_token: str, client_ip: str) -> dict:
 
     security_logger.warning(f"AUTH_FAIL invalid_token ip={client_ip} len={len(id_token)} prefix={id_token[:20]}")
     raise HTTPException(status_code=401, detail="Invalid Firebase token")
-
 def _build_user_profile(decoded: dict) -> dict:
     uid = decoded.get("uid") or decoded.get("user_id")
     if not uid:
@@ -264,6 +272,7 @@ async def _upsert_user(profile: dict) -> dict:
     uid = profile["uid"]
     now = datetime.now(timezone.utc)
     user = await db.users.find_one({"user_id": uid}, {"_id": 0})
+    
     if not user:
         user = {
             "user_id": uid,
@@ -272,22 +281,30 @@ async def _upsert_user(profile: dict) -> dict:
             "name": profile["name"],
             "picture": profile["picture"],
             "auth_provider": "firebase",
-            "auth_provider_id": profile["provider_id"],
+            "auth_provider_id": profile.get("provider_id"),
             "created_at": now,
             "last_login_at": now,
         }
         try:
             await db.users.insert_one(user)
-            security_logger.info(f"AUTH_NEW_USER uid={uid} provider={profile['provider_id']}")
+            security_logger.info(f"AUTH_NEW_USER uid={uid} provider={profile.get('provider_id')}")
         except Exception:
             user = await db.users.find_one({"user_id": uid}, {"_id": 0}) or user
     else:
         updates = {"last_login_at": now}
+        
+        # 🔥 FIX: AGGIORNIAMO IL PROVIDER SE L'UTENTE SI È REGISTRATO DA OSPITE!
+        # Questo toglie definitivamente il "lucchetto" e fa apparire il codice amico.
+        if profile.get("provider_id") and user.get("auth_provider_id") != profile["provider_id"]:
+            updates["auth_provider_id"] = profile["provider_id"]
+
         for key in ("name", "picture", "email", "email_verified"):
-            if profile[key] and user.get(key) != profile[key]:
+            if profile.get(key) and user.get(key) != profile[key]:
                 updates[key] = profile[key]
+                
         await db.users.update_one({"user_id": uid}, {"$set": updates})
         user.update(updates)
+        
     await ensure_friend_code(user)
     return user
 
