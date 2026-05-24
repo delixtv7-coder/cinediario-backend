@@ -1259,11 +1259,10 @@ async def movie_quiz(request: Request, tmdb_id: int):
     await _cache_quiz(tmdb_id, payload)
     return payload
 
-@api_router.get("/")
+# Modifica da api_router.get("/") a app.get("/")
+@app.get("/")
 async def root():
     return {"message": "CineDiario API", "status": "ok"}
-
-app.include_router(api_router)
 
 if ALLOWED_HOSTS and ALLOWED_HOSTS != ["*"]:
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
