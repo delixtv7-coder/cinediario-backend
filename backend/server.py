@@ -693,7 +693,9 @@ async def list_friends(request: Request, user: dict = Depends(get_current_user))
     out = []
     async for fr in cursor:
         out.append(await _friend_profile(_other_user(fr, me)))
-    return out
+        
+    # FIX: Mettiamo i dati nella "scatola" chiamata "friends" che l'app si aspetta!
+    return {"friends": out}
 
 @api_router.get("/friends/requests")
 @limiter.limit("60/minute")
@@ -840,7 +842,9 @@ async def shares_inbox(request: Request, user: dict = Depends(get_current_user))
             "read": bool(s.get("read", False)),
             "created_at": (s.get("created_at") or datetime.now(timezone.utc)).isoformat(),
         })
-    return out
+        
+    # FIX: Mettiamo i dati nella "scatola" chiamata "items"
+    return {"items": out}
 
 @api_router.post("/shares")
 @limiter.limit("20/minute")
