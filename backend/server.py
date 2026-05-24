@@ -156,17 +156,22 @@ class UpdateMovieReq(BaseModel):
 # e il banner per registrarsi nel Profilo.
 # -------------------------------------------------------------
 def serialize_user(user: dict) -> dict:
-    # Controlliamo in modo più robusto se l'utente è un ospite anonimo di Firebase
-    provider_id = user.get("auth_provider_id")
-    is_guest = provider_id == "anonymous" or provider_id is None or user.get("auth_provider") == "guest"
+    # REGOLA D'ORO: Se non c'è l'email, l'utente è un ospite anonimo (Guest)
+    email = user.get("email", "").strip()
     
+    if not email:
+        is_guest = True
+    else:
+        # Se c'è l'email, controlliamo i provider tradizionali
+        is_guest = user.get("auth_provider_id") == "anonymous" or user.get("auth_provider") == "guest"
+        
     return {
         "user_id": user["user_id"],
-        "email": user.get("email", ""),
+        "email": email,
         "name": user.get("name", ""),
         "picture": user.get("picture"),
         "is_guest": is_guest,
-        "friend_code": user.get("friend_code"),
+        "friend_code": user.get("friend_code") if not is_guest else None,
     }
 
 def _generate_friend_code() -> str:
@@ -273,9 +278,12 @@ def _build_user_profile(decoded: dict) -> dict:
 async def _upsert_user(profile: dict) -> dict:
     uid = profile["uid"]
     now = datetime.now(timezone.utc)
+    
+    # Cerchiamo l'utente nel database MongoDB Atlas
     user = await db.users.find_one({"user_id": uid}, {"_id": 0})
     
     if not user:
+        # NUOVO UTENTE (Registrato o Ospite)
         user = {
             "user_id": uid,
             "email": profile["email"],
@@ -288,23 +296,25 @@ async def _upsert_user(profile: dict) -> dict:
             "last_login_at": now,
         }
         try:
-            # Generiamo il friend code SUBITO prima di inserire il nuovo utente
+            # Generiamo e assegniamo IMMEDIATAMENTE il codice amico prima del salvataggio
             await ensure_friend_code(user)
             await db.users.insert_one(user)
             security_logger.info(f"AUTH_NEW_USER uid={uid} provider={profile.get('provider_id')}")
         except Exception:
             user = await db.users.find_one({"user_id": uid}, {"_id": 0}) or user
     else:
+        # UTENTE GIÀ ESISTENTE
         updates = {"last_login_at": now}
         
+        # Se l'utente era ospite e ora si è registrato, aggiorniamo il suo provider di accesso
         if profile.get("provider_id") and user.get("auth_provider_id") != profile["provider_id"]:
             updates["auth_provider_id"] = profile["provider_id"]
 
         for key in ("name", "picture", "email", "email_verified"):
             if profile.get(key) and user.get(key) != profile[key]:
                 updates[key] = profile[key]
-                
-        # Ci assicuriamo che l'utente ESISTENTE abbia un codice amico
+        
+        # Forza il controllo e il recupero del codice amico per l'utente esistente
         await ensure_friend_code(user)
         updates["friend_code"] = user["friend_code"]
                 
