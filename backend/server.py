@@ -149,6 +149,12 @@ class UpdateMovieReq(BaseModel):
     rating_cinematography: Optional[float] = None
 
 # ===== Helpers =====
+
+# -------------------------------------------------------------
+# IL FIX "OSPITI" È QUI! 
+# Serve per far apparire la scritta "Funzione Riservata" in Amici 
+# e il banner per registrarsi nel Profilo.
+# -------------------------------------------------------------
 def serialize_user(user: dict) -> dict:
     is_guest = user.get("auth_provider_id") == "anonymous" or user.get("auth_provider") == "guest"
     return {
@@ -156,7 +162,7 @@ def serialize_user(user: dict) -> dict:
         "email": user.get("email", ""),
         "name": user.get("name", ""),
         "picture": user.get("picture"),
-        "is_guest": is_guest,
+        "is_guest": is_guest,  
         "friend_code": user.get("friend_code"),
     }
 
@@ -588,6 +594,10 @@ async def user_stats(request: Request, user: dict = Depends(get_current_user)):
         "watched_hours": round(sum_minutes / 60, 1),
     }
 
+# -------------------------------------------------------------
+# IL FIX "HOME" È QUI! 
+# Se non hai votato nulla, manda il messaggio (e i pop anche per scorta)
+# -------------------------------------------------------------
 @api_router.get("/user/recommendations")
 @limiter.limit("20/minute")
 async def user_recommendations(request: Request, user: dict = Depends(get_current_user)):
@@ -601,10 +611,12 @@ async def user_recommendations(request: Request, user: dict = Depends(get_curren
     async for d in db.user_movies.find({"user_id": user["user_id"]}, {"_id": 0, "tmdb_id": 1}):
         already_ids.add(d["tmdb_id"])
 
-  if not seeds:
+    # Se non c'è nessun voto o non ci sono film, ritorna i popolari ma AGGIUNGE il messaggio!
+    if not seeds:
+        data = await tmdb_get("/movie/popular", {"page": 1})
+        recs = [fmt_movie(m) for m in data.get("results", []) if m.get("id") not in already_ids]
         return {
-            "recommendations": [],
-            "seed_titles": [],
+            "recommendations": recs[:20], 
             "message": "Valuta almeno un film per ricevere suggerimenti personalizzati"
         }
 
@@ -1039,11 +1051,8 @@ def _format_cast_block(cast: list) -> str:
             lines.append(f"- {nm}")
     return "\n".join(lines) if lines else "(non disponibile)"
 
-
-# IL FIX DELLE ISTRUZIONI DI EMERGENT È QUI
 def _build_quiz_prompt(ctx: dict) -> str:
     return f"""Genera un quiz e un riassunto chiave per il film:
-
 TITOLO ITALIANO: {ctx['title']}
 TITOLO ORIGINALE: {ctx['original_title']}
 ANNO: {ctx['year'] or 'sconosciuto'}
@@ -1097,8 +1106,7 @@ async def _call_llm_for_quiz(tmdb_id: int, prompt: str) -> str:
     if not GEMINI_API_KEY:
         raise HTTPException(status_code=500, detail="LLM non configurato")
     system_msg = (
-        "Sei un esperto di cinema italiano. Generi quiz a scelta multipla sulla TRAMA dei film "
-        "(NON su anno, regista, durata o paese di produzione) e brevi riassunti narrativi in italiano. "
+        "Sei un esperto di cinema italiano. Generi quiz a scelta multipla sulla TRAMA dei film. "
         "Rispondi SOLO con un oggetto JSON valido, senza markdown, senza testo prima o dopo."
     )
     body = {
@@ -1217,7 +1225,6 @@ async def movie_quiz(request: Request, tmdb_id: int):
 
     ctx = _extract_quiz_context(details)
     
-    # IL PIANO B: Trama in inglese se manca l'italiano
     if not ctx.get("overview") or len(ctx["overview"]) < 30:
         try:
             en_details = await tmdb_get(f"/movie/{tmdb_id}", {"language": "en-US"})
