@@ -720,7 +720,7 @@ async def list_friend_requests(request: Request, user: dict = Depends(get_curren
 class FriendRequestReq(BaseModel):
     friend_code: str
 
-@api_router.post("/friends/requests")
+@api_router.post("/friends/request")
 @limiter.limit("10/minute")
 async def send_friend_request(request: Request, req: FriendRequestReq, user: dict = Depends(get_current_user)):
     code = req.friend_code.strip().upper()
