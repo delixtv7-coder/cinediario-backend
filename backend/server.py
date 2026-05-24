@@ -150,12 +150,13 @@ class UpdateMovieReq(BaseModel):
 
 # ===== Helpers =====
 def serialize_user(user: dict) -> dict:
+    is_guest = user.get("auth_provider_id") == "anonymous" or user.get("auth_provider") == "guest"
     return {
         "user_id": user["user_id"],
         "email": user.get("email", ""),
         "name": user.get("name", ""),
         "picture": user.get("picture"),
-        "is_guest": False,
+        "is_guest": is_guest,
         "friend_code": user.get("friend_code"),
     }
 
@@ -600,10 +601,12 @@ async def user_recommendations(request: Request, user: dict = Depends(get_curren
     async for d in db.user_movies.find({"user_id": user["user_id"]}, {"_id": 0, "tmdb_id": 1}):
         already_ids.add(d["tmdb_id"])
 
-    if not seeds:
-        data = await tmdb_get("/movie/popular", {"page": 1})
-        recs = [fmt_movie(m) for m in data.get("results", []) if m.get("id") not in already_ids]
-        return {"recommendations": recs[:20], "message": "Vota qualche film per ricevere consigli personalizzati!"}
+  if not seeds:
+        return {
+            "recommendations": [],
+            "seed_titles": [],
+            "message": "Valuta almeno un film per ricevere suggerimenti personalizzati"
+        }
 
     out = []
     seen = set()
