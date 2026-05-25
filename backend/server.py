@@ -486,25 +486,8 @@ async def _movie_snapshot(tmdb_id: int) -> dict:
         }
     except Exception:
         return {"tmdb_id": tmdb_id, "title": "", "poster_url": None}
-    
-    try:
-        details = await tmdb_get(f"/movie/{tmdb_id}")
-        return {
-            "tmdb_id": details["id"],
-            "title": details.get("title") or details.get("original_title", ""),
-            "poster_url": f"{TMDB_IMG}{details['poster_path']}" if details.get("poster_path") else None,
-            "backdrop_url": f"{TMDB_IMG}{details['backdrop_path']}" if details.get("backdrop_path") else None,
-            "release_date": details.get("release_date"),
-            "overview": details.get("overview"),
-            "vote_average": details.get("vote_average", 0),
-            "genres": [g.get("name") for g in details.get("genres", []) if g.get("name")],
-            "runtime": details.get("runtime"),
-        }
-    except Exception:
-        return {"tmdb_id": tmdb_id, "title": "", "poster_url": None}
 
-
-    def _serialize_user_movie(doc: dict) -> dict:
+def _serialize_user_movie(doc: dict) -> dict:
     movie_obj = doc.get("movie") or {}
     return {
         "tmdb_id": doc["tmdb_id"],
