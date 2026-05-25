@@ -511,6 +511,32 @@ def _serialize_user_movie(doc: dict) -> dict:
         "production_countries": movie_obj.get("production_countries", []),
         "release_date": movie_obj.get("release_date"),
     }
+@api_router.post("/user/movies/fix-metadata")
+@limiter.limit("5/minute")
+async def fix_old_movies_metadata(request: Request, user: dict = Depends(get_current_user)):
+    # Cerchiamo tutti i film dell'utente che non hanno le nazionalità salvate nel database
+    cursor = db.user_movies.find({
+        "user_id": user["user_id"],
+        "$or": [
+            {"movie.production_countries": {"$exists": False}},
+            {"movie.production_countries": None}
+        ]
+    })
+    
+    updated_count = 0
+    async for doc in cursor:
+        tmdb_id = doc["tmdb_id"]
+        # Scarichiamo lo snapshot aggiornato da TMDB (che ora include generi e nazionalità)
+        new_snapshot = await _movie_snapshot(tmdb_id)
+        
+        # Aggiorniamo il documento nel database
+        await db.user_movies.update_one(
+            {"user_id": user["user_id"], "tmdb_id": tmdb_id},
+            {"$set": {"movie": new_snapshot}}
+        )
+        updated_count += 1
+        
+    return {"ok": True, "updated_count": updated_count}
 
 @api_router.get("/user/movies")
 @limiter.limit("60/minute")
