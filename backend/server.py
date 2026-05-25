@@ -456,7 +456,8 @@ async def auth_me(request: Request, user: dict = Depends(get_current_user)):
 class PushTokenReq(BaseModel):
     token: str
 
-@api_router.post("/api/user/push-token")
+# FIX: Rimosso il prefisso /api di troppo nella stringa qui sotto
+@api_router.post("/user/push-token")
 @limiter.limit("5/minute")
 async def save_push_token(request: Request, req: PushTokenReq, user: dict = Depends(get_current_user)):
     await db.users.update_one(
