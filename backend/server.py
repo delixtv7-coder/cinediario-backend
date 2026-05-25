@@ -812,8 +812,9 @@ async def remove_friend(request: Request, friend_user_id: str, user: dict = Depe
 
 # ===== SHARES =====
 class ShareReq(BaseModel):
-    to_user_id: str
+    to_user_ids: List[str]  # Ora accetta una lista
     tmdb_id: int
+    share_type: str = "recommendation"  # Aggiungiamo il tipo
     message: Optional[str] = None
 
 async def _are_friends(a: str, b: str) -> bool:
@@ -849,23 +850,58 @@ async def shares_inbox(request: Request, user: dict = Depends(get_current_user))
 @api_router.post("/shares")
 @limiter.limit("20/minute")
 async def create_share(request: Request, req: ShareReq, user: dict = Depends(get_current_user)):
-    if req.to_user_id == user["user_id"]:
-        raise HTTPException(status_code=400, detail="Non puoi condividere con te stesso")
-    if not await _are_friends(user["user_id"], req.to_user_id):
-        raise HTTPException(status_code=403, detail="Puoi condividere solo con i tuoi amici")
-    snapshot = await _movie_snapshot(req.tmdb_id)
-    share_id = f"sh_{uuid.uuid4().hex[:12]}"
-    await db.shares.insert_one({
-        "share_id": share_id,
-        "from_user_id": user["user_id"],
-        "to_user_id": req.to_user_id,
+    if user.get("auth_provider") == "guest":
+        raise HTTPException(status_code=403, detail="Crea un account per condividere")
+    if not req.to_user_ids:
+        raise HTTPException(status_code=400, detail="Seleziona almeno un amico")
+
+    # Verifica amici
+    me = user["user_id"]
+    for tid in req.to_user_ids:
+        if not await _are_friends(me, tid):
+            raise HTTPException(status_code=403, detail="Puoi condividere solo con i tuoi amici")
+
+    # Snapshot film
+    movie = await tmdb_get(f"/movie/{req.tmdb_id}")
+    movie_snap = {
+        "tmdb_id": movie.get("id"),
+        "title": movie.get("title") or movie.get("original_title", ""),
+        "poster_url": f"{TMDB_IMG}{movie['poster_path']}" if movie.get("poster_path") else None,
+        "release_date": movie.get("release_date"),
+        "vote_average": movie.get("vote_average"),
+    }
+    
+    # Snapshot recensione se il tipo è review
+    review_snap = None
+    if req.share_type == "review":
+        item = await db.user_movies.find_one({"user_id": me, "tmdb_id": req.tmdb_id, "status": "watched"})
+        if item:
+            review_snap = {
+                "rating": item.get("rating"),
+                "notes": item.get("notes"),
+                "rating_directing": item.get("rating_directing"),
+                "rating_acting": item.get("rating_acting"),
+                "rating_screenplay": item.get("rating_screenplay"),
+                "rating_soundtrack": item.get("rating_soundtrack"),
+                "rating_cinematography": item.get("rating_cinematography"),
+            }
+
+    # Creazione docs per ogni amico
+    docs = [{
+        "share_id": uuid.uuid4().hex,
+        "from_user_id": me,
+        "to_user_id": tid,
         "tmdb_id": req.tmdb_id,
-        "movie": snapshot,
+        "share_type": req.share_type,
         "message": (req.message or "").strip()[:500] or None,
+        "movie_snapshot": movie_snap,
+        "review_snapshot": review_snap,
         "read": False,
         "created_at": datetime.now(timezone.utc),
-    })
-    return {"ok": True, "share_id": share_id}
+    } for tid in req.to_user_ids]
+    
+    await db.shares.insert_many(docs)
+    return {"ok": True, "sent": len(docs)}
 
 @api_router.post("/shares/{share_id}/read")
 @limiter.limit("60/minute")
