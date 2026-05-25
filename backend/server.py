@@ -456,7 +456,7 @@ async def auth_me(request: Request, user: dict = Depends(get_current_user)):
 class PushTokenReq(BaseModel):
     token: str
 
-@api_router.post("/user/push-token")
+@api_router.post("/api/user/push-token")
 @limiter.limit("5/minute")
 async def save_push_token(request: Request, req: PushTokenReq, user: dict = Depends(get_current_user)):
     await db.users.update_one(
@@ -920,24 +920,23 @@ async def create_share(request: Request, req: ShareReq, user: dict = Depends(get
     # Inserimento nel database
     await db.shares.insert_many(docs)
     
-    # === INVIO NOTIFICHE PUSH ===
-    for tid in req.to_user_ids:
-        target_user = await db.users.find_one({"user_id": tid})
-        if target_user:
-            token = target_user.get("push_token")
-            if token:
-                try:
-                    msg = messaging.Message(
-                        notification=messaging.Notification(
-                            title="Nuovo film condiviso!", 
-                            body=f"{user.get('name', 'Qualcuno')} ti ha inviato un film."
-                        ),
-                        token=token,
-                    )
-                    messaging.send(msg)
-                except Exception as e:
-                    logger.error(f"Errore invio notifica push a {tid}: {e}")
-    # ==================================
+    # === INVIO NOTIFICHE TRAMITE EXPO (DEFINITIVO ANCHE PER APK) ===
+    async with httpx.AsyncClient() as client:
+        for tid in req.to_user_ids:
+            target_user = await db.users.find_one({"user_id": tid})
+            if target_user:
+                token_dispositivo = target_user.get("push_token")
+                if token_dispositivo and token_dispositivo.startswith("ExponentPushToken"):
+                    payload = {
+                        "to": token_dispositivo,
+                        "title": "🎬 Nuovo film condiviso!",
+                        "body": f"{user.get('name', 'Qualcuno')} ti ha inviato un film."
+                    }
+                    try:
+                        await client.post("https://exp.host/--/api/v2/push/send", json=payload)
+                    except Exception as e:
+                        logger.error(f"Errore invio notifica a {tid}: {e}")
+    # ===============================================================
     
     return {"ok": True, "sent": len(docs)}
 
