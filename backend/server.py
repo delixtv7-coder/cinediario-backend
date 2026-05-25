@@ -1007,6 +1007,10 @@ async def ai_movie_finder(request: Request, req: MovieFinderReq, user: dict = De
 {ans_block}
 Note libere: {extra or '(nessuna)'}
 
+ATTENZIONE - REGOLA FERREA SULLE PIATTAFORME:
+Se l'utente indica "Amazon", "Prime", "Prime Video" o simili tra le piattaforme, devi consigliare ESCLUSIVAMENTE film che sono inclusi GRATUITAMENTE nell'abbonamento Prime Video Italia. È severamente vietato suggerire film che su Amazon sono disponibili solo a noleggio o per l'acquisto.
+Applica questa regola a tutte le piattaforme: suggerisci solo film inclusi nell'abbonamento base (streaming flatrate).
+
 Restituisci SOLO un oggetto JSON con questo formato esatto:
 {{"movies": [{{"title": "Titolo italiano del film", "year": 2010, "why": "Breve motivo (max 25 parole) in italiano"}}, ...]}}
 Esattamente 7 film, in italiano, vari per stile ma coerenti con le risposte.
@@ -1017,6 +1021,7 @@ Non aggiungere testo prima o dopo il JSON, non usare markdown."""
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.8, "responseMimeType": "application/json"},
     }
+    
     try:
         async with httpx.AsyncClient(timeout=30.0) as c:
             r = await c.post(GEMINI_URL, params={"key": GEMINI_API_KEY}, json=body)
