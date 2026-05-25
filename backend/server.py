@@ -23,6 +23,7 @@ from slowapi.errors import RateLimitExceeded
 # Firebase Admin SDK
 import firebase_admin
 from firebase_admin import credentials, auth as firebase_auth
+from firebase_admin import messaging
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -452,6 +453,18 @@ async def auth_me(request: Request, user: dict = Depends(get_current_user)):
     return {"user": serialize_user(user)}
 
 # ===== USER MOVIES =====
+class PushTokenReq(BaseModel):
+    token: str
+
+@api_router.post("/user/push-token")
+@limiter.limit("5/minute")
+async def save_push_token(request: Request, req: PushTokenReq, user: dict = Depends(get_current_user)):
+    await db.users.update_one(
+        {"user_id": user["user_id"]}, 
+        {"$set": {"push_token": req.token}}
+    )
+    return {"ok": True}
+
 VALID_STATUSES = {"watched", "watchlist", "favorite", "watching"}
 
 async def _movie_snapshot(tmdb_id: int) -> dict:
@@ -904,7 +917,28 @@ async def create_share(request: Request, req: ShareReq, user: dict = Depends(get
         "created_at": datetime.now(timezone.utc),
     } for tid in req.to_user_ids]
     
+    # Inserimento nel database
     await db.shares.insert_many(docs)
+    
+    # === INVIO NOTIFICHE PUSH ===
+    for tid in req.to_user_ids:
+        target_user = await db.users.find_one({"user_id": tid})
+        if target_user:
+            token = target_user.get("push_token")
+            if token:
+                try:
+                    msg = messaging.Message(
+                        notification=messaging.Notification(
+                            title="Nuovo film condiviso!", 
+                            body=f"{user.get('name', 'Qualcuno')} ti ha inviato un film."
+                        ),
+                        token=token,
+                    )
+                    messaging.send(msg)
+                except Exception as e:
+                    logger.error(f"Errore invio notifica push a {tid}: {e}")
+    # ==================================
+    
     return {"ok": True, "sent": len(docs)}
 
 @api_router.post("/shares/{share_id}/read")
