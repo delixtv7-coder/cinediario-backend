@@ -1381,6 +1381,67 @@ async def _cache_quiz(tmdb_id: int, payload: dict) -> None:
     except Exception:
         pass
 
+# ===== RECENSIONI PUBBLICHE (COMMUNITY) =====
+
+class PublicReviewReq(BaseModel):
+    text: str
+    rating: Optional[float] = None
+    is_anonymous: bool = False
+
+@api_router.post("/movies/{tmdb_id}/public-reviews")
+@limiter.limit("10/minute")
+async def add_public_review(request: Request, tmdb_id: int, req: PublicReviewReq, user: dict = Depends(get_current_user)):
+    if user.get("auth_provider") == "guest":
+        raise HTTPException(status_code=403, detail="Crea un account per lasciare recensioni pubbliche")
+    
+    text_stripped = req.text.strip()
+    if not text_stripped:
+        raise HTTPException(status_code=400, detail="Il testo della recensione non può essere vuoto")
+        
+    now = datetime.now(timezone.utc)
+    
+    review_doc = {
+        "review_id": uuid.uuid4().hex,
+        "tmdb_id": tmdb_id,
+        "user_id": user["user_id"],
+        # Salviamo il nome reale e la foto, decideremo in lettura se mostrarli
+        "user_name": user.get("name", "Utente"),
+        "user_picture": user.get("picture"),
+        "text": text_stripped[:1000], # Limite preventivo a 1000 caratteri
+        "rating": req.rating,
+        "is_anonymous": req.is_anonymous,
+        "created_at": now
+    }
+    
+    # Usiamo un update_one con upsert=True se vogliamo che ogni utente possa lasciare
+    # UNA SOLA recensione pubblica per film, modificando la precedente se la riscrive.
+    await db.public_reviews.update_one(
+        {"tmdb_id": tmdb_id, "user_id": user["user_id"]},
+        {"$set": review_doc},
+        upsert=True
+    )
+    
+    return {"ok": True}
+
+@api_router.get("/movies/{tmdb_id}/public-reviews")
+@limiter.limit("60/minute")
+async def get_public_reviews(request: Request, tmdb_id: int):
+    cursor = db.public_reviews.find({"tmdb_id": tmdb_id}).sort("created_at", -1).limit(50)
+    out = []
+    async for r in cursor:
+        # Mascheriamo i dati sensibili se l'utente ha scelto l'anonimato
+        is_anon = r.get("is_anonymous", False)
+        out.append({
+            "review_id": r["review_id"],
+            "text": r["text"],
+            "rating": r.get("rating"),
+            "created_at": r["created_at"].isoformat(),
+            "user_name": "Utente Anonimo" if is_anon else r.get("user_name", "Utente"),
+            "user_picture": None if is_anon else r.get("user_picture"),
+            "is_anonymous": is_anon
+        })
+    return {"reviews": out}
+
 @api_router.get("/quiz/{tmdb_id}")
 @limiter.limit("20/minute")
 async def movie_quiz(request: Request, tmdb_id: int):
@@ -1455,6 +1516,7 @@ async def startup_db():
     await db.friendships.create_index("request_id", unique=True, sparse=True)
     await db.shares.create_index("share_id", unique=True)
     await db.shares.create_index([("to_user_id", 1), ("read", 1), ("created_at", -1)])
+    await db.public_reviews.create_index([("tmdb_id", 1), ("created_at", -1)])
     logger.info("CineDiario backend ready (Firebase Auth + MongoDB Atlas + Security hardened)")
 
 @app.on_event("shutdown")
