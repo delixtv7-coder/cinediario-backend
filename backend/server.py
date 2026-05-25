@@ -834,17 +834,21 @@ async def shares_inbox(request: Request, user: dict = Depends(get_current_user))
     cursor = db.shares.find({"to_user_id": user["user_id"]}, {"_id": 0}).sort("created_at", -1).limit(100)
     out = []
     async for s in cursor:
+        # Salvagente: recupera i dati del film sia se salvati col formato nuovo che col vecchio
+        movie_data = s.get("movie_snapshot") or s.get("movie") or {}
+        
         out.append({
             "share_id": s["share_id"],
-            "from": await _friend_profile(s["from_user_id"]),
+            "from_user": await _friend_profile(s["from_user_id"]),   # FIX: from_user (non from)
             "tmdb_id": s["tmdb_id"],
-            "movie": s.get("movie"),
+            "share_type": s.get("share_type", "recommendation"),     # FIX: mancava
+            "movie_snapshot": movie_data,                            # FIX: movie_snapshot (non movie)
+            "review_snapshot": s.get("review_snapshot"),             # FIX: mancava
             "message": s.get("message"),
             "read": bool(s.get("read", False)),
             "created_at": (s.get("created_at") or datetime.now(timezone.utc)).isoformat(),
         })
         
-    # FIX: Mettiamo i dati nella "scatola" chiamata "items"
     return {"items": out}
 
 @api_router.post("/shares")
