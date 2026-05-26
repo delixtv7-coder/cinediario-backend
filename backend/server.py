@@ -1457,6 +1457,27 @@ async def add_review_reply(request: Request, tmdb_id: int, review_id: str, req: 
 
     return {"ok": True, "reply": reply}
 
+@api_router.delete("/movies/{tmdb_id}/public-reviews/{review_id}")
+@limiter.limit("20/minute")
+async def delete_review(request: Request, tmdb_id: int, review_id: str, user: dict = Depends(get_current_user)):
+    # Elimina solo se la recensione appartiene all'utente
+    result = await db.public_reviews.delete_one({"review_id": review_id, "user_id": user["user_id"]})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=403, detail="Non puoi eliminare questa recensione")
+    return {"ok": True}
+
+@api_router.delete("/movies/{tmdb_id}/public-reviews/{review_id}/reply/{reply_id}")
+@limiter.limit("20/minute")
+async def delete_reply(request: Request, tmdb_id: int, review_id: str, reply_id: str, user: dict = Depends(get_current_user)):
+    # Rimuove la risposta specifica dall'array
+    result = await db.public_reviews.update_one(
+        {"review_id": review_id, "user_id": {"$ne": None}}, # Verifiche base
+        {"$pull": {"replies": {"reply_id": reply_id, "user_id": user["user_id"]}}}
+    )
+    if result.modified_count == 0:
+        raise HTTPException(status_code=403, detail="Non puoi eliminare questa risposta")
+    return {"ok": True}
+
 @api_router.get("/movies/{tmdb_id}/public-reviews")
 @limiter.limit("60/minute")
 async def get_public_reviews(request: Request, tmdb_id: int):
