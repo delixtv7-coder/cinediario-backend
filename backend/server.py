@@ -1384,7 +1384,7 @@ async def _cache_quiz(tmdb_id: int, payload: dict) -> None:
 # ===== RECENSIONI PUBBLICHE (COMMUNITY) =====
 
 class PublicReviewReq(BaseModel):
-    text: str
+    text: Optional[str] = None
     rating: Optional[float] = None
     is_anonymous: bool = False
 
@@ -1394,9 +1394,11 @@ async def add_public_review(request: Request, tmdb_id: int, req: PublicReviewReq
     if user.get("auth_provider") == "guest":
         raise HTTPException(status_code=403, detail="Crea un account per lasciare recensioni pubbliche")
     
-    text_stripped = req.text.strip()
-    if not text_stripped:
-        raise HTTPException(status_code=400, detail="Il testo della recensione non può essere vuoto")
+    text_stripped = req.text.strip() if req.text else ""
+    
+    # Se non c'è né testo né voto, blocchiamo
+    if not text_stripped and req.rating is None:
+        raise HTTPException(status_code=400, detail="Inserisci un voto o un commento")
         
     now = datetime.now(timezone.utc)
     
@@ -1404,17 +1406,14 @@ async def add_public_review(request: Request, tmdb_id: int, req: PublicReviewReq
         "review_id": uuid.uuid4().hex,
         "tmdb_id": tmdb_id,
         "user_id": user["user_id"],
-        # Salviamo il nome reale e la foto, decideremo in lettura se mostrarli
         "user_name": user.get("name", "Utente"),
         "user_picture": user.get("picture"),
-        "text": text_stripped[:1000], # Limite preventivo a 1000 caratteri
+        "text": text_stripped[:1000] if text_stripped else None,
         "rating": req.rating,
         "is_anonymous": req.is_anonymous,
         "created_at": now
     }
     
-    # Usiamo un update_one con upsert=True se vogliamo che ogni utente possa lasciare
-    # UNA SOLA recensione pubblica per film, modificando la precedente se la riscrive.
     await db.public_reviews.update_one(
         {"tmdb_id": tmdb_id, "user_id": user["user_id"]},
         {"$set": review_doc},
