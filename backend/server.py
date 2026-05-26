@@ -1383,10 +1383,15 @@ async def _cache_quiz(tmdb_id: int, payload: dict) -> None:
 
 # ===== RECENSIONI PUBBLICHE (COMMUNITY) =====
 
+# ===== RECENSIONI PUBBLICHE E RISPOSTE (COMMUNITY) =====
+
 class PublicReviewReq(BaseModel):
     text: Optional[str] = None
     rating: Optional[float] = None
     is_anonymous: bool = False
+
+class ReplyReq(BaseModel):
+    text: str
 
 @api_router.post("/movies/{tmdb_id}/public-reviews")
 @limiter.limit("10/minute")
@@ -1396,7 +1401,6 @@ async def add_public_review(request: Request, tmdb_id: int, req: PublicReviewReq
     
     text_stripped = req.text.strip() if req.text else ""
     
-    # Se non c'è né testo né voto, blocchiamo
     if not text_stripped and req.rating is None:
         raise HTTPException(status_code=400, detail="Inserisci un voto o un commento")
         
@@ -1412,6 +1416,7 @@ async def add_public_review(request: Request, tmdb_id: int, req: PublicReviewReq
         "rating": req.rating,
         "is_anonymous": req.is_anonymous,
         "created_at": now
+        # Le "replies" verranno create in automatico al primo commento
     }
     
     await db.public_reviews.update_one(
@@ -1422,22 +1427,52 @@ async def add_public_review(request: Request, tmdb_id: int, req: PublicReviewReq
     
     return {"ok": True}
 
+@api_router.post("/movies/{tmdb_id}/public-reviews/{review_id}/reply")
+@limiter.limit("15/minute")
+async def add_review_reply(request: Request, tmdb_id: int, review_id: str, req: ReplyReq, user: dict = Depends(get_current_user)):
+    if user.get("auth_provider") == "guest":
+        raise HTTPException(status_code=403, detail="Crea un account per rispondere")
+
+    text_stripped = req.text.strip()
+    if not text_stripped:
+        raise HTTPException(status_code=400, detail="Il testo non può essere vuoto")
+
+    reply = {
+        "reply_id": uuid.uuid4().hex,
+        "user_id": user["user_id"],
+        "user_name": user.get("name", "Utente"),
+        "user_picture": user.get("picture"),
+        "text": text_stripped[:500],
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+
+    # $push inserisce la risposta dentro l'array "replies" della recensione genitore
+    result = await db.public_reviews.update_one(
+        {"tmdb_id": tmdb_id, "review_id": review_id},
+        {"$push": {"replies": reply}}
+    )
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Recensione non trovata")
+
+    return {"ok": True, "reply": reply}
+
 @api_router.get("/movies/{tmdb_id}/public-reviews")
 @limiter.limit("60/minute")
 async def get_public_reviews(request: Request, tmdb_id: int):
     cursor = db.public_reviews.find({"tmdb_id": tmdb_id}).sort("created_at", -1).limit(50)
     out = []
     async for r in cursor:
-        # Mascheriamo i dati sensibili se l'utente ha scelto l'anonimato
         is_anon = r.get("is_anonymous", False)
         out.append({
             "review_id": r["review_id"],
-            "text": r["text"],
+            "text": r.get("text"),
             "rating": r.get("rating"),
-            "created_at": r["created_at"].isoformat(),
+            "created_at": r["created_at"].isoformat() if "created_at" in r else None,
             "user_name": "Utente Anonimo" if is_anon else r.get("user_name", "Utente"),
             "user_picture": None if is_anon else r.get("user_picture"),
-            "is_anonymous": is_anon
+            "is_anonymous": is_anon,
+            "replies": r.get("replies", []) # Ora il server invia anche le risposte
         })
     return {"reviews": out}
 
