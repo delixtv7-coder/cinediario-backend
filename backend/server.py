@@ -11,6 +11,7 @@ from pathlib import Path
 from pydantic import BaseModel
 from typing import List, Optional
 import uuid
+import asyncio
 from datetime import datetime, timezone
 import httpx
 import secrets
@@ -1578,6 +1579,79 @@ async def unhandled_exception(request: Request, exc: Exception):
         return JSONResponse(status_code=500, content={"detail": "Internal server error"})
     return JSONResponse(status_code=500, content={"detail": f"{type(exc).__name__}: {exc}"})
 
+# ==========================================
+# MOTORE NOTIFICHE ATTORI IN BACKGROUND
+# ==========================================
+async def background_actor_checker():
+    while True:
+        try:
+            # Aspetta 1 minuto all'avvio del server prima di iniziare
+            await asyncio.sleep(60) 
+            logger.info("Inizio controllo giornaliero nuovi film attori...")
+            
+            # 1. Prendi tutti gli ID degli attori che sono seguiti da almeno un utente
+            followed_people = await db.user_people.distinct("person_id")
+            today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            
+            async with httpx.AsyncClient() as client:
+                for person_id in followed_people:
+                    try:
+                        # 2. Chiedi a TMDB i film di questo attore
+                        credits = await tmdb_get(f"/person/{person_id}/movie_credits", {"language": "it-IT"})
+                        cast = credits.get("cast", [])
+                        
+                        for movie in cast:
+                            release_date = movie.get("release_date")
+                            movie_id = movie.get("id")
+                            
+                            # Se il film non ha una data, saltalo
+                            if not release_date:
+                                continue
+
+                            # Controlliamo se lo abbiamo già notificato in passato per non spammare
+                            already_notified = await db.notifications_log.find_one({"person_id": person_id, "movie_id": movie_id})
+                            
+                            # 3. Se NON lo abbiamo mai notificato E la data di uscita è futura o recente (esce da oggi in poi)
+                            if not already_notified and release_date >= today_str:
+                                # Segna nel database che lo stiamo notificando oggi
+                                await db.notifications_log.insert_one({
+                                    "person_id": person_id, 
+                                    "movie_id": movie_id, 
+                                    "created_at": datetime.now(timezone.utc)
+                                })
+                                
+                                # 4. Trova TUTTI gli utenti che seguono questo attore
+                                followers = db.user_people.find({"person_id": person_id})
+                                async for f in followers:
+                                    user_data = await db.users.find_one({"user_id": f["user_id"]})
+                                    if user_data and user_data.get("push_token"):
+                                        token = user_data["push_token"]
+                                        actor_name = f.get("name", "Un attore che segui")
+                                        movie_title = movie.get("title", "un nuovo film")
+                                        
+                                        # 5. Prepara e invia la notifica PUSH al telefono!
+                                        payload = {
+                                            "to": token,
+                                            "title": f"🎬 Novità per {actor_name}!",
+                                            "body": f"È in arrivo '{movie_title}' (Uscita: {release_date})."
+                                        }
+                                        try:
+                                            await client.post("https://exp.host/--/api/v2/push/send", json=payload)
+                                        except Exception as e:
+                                            logger.error(f"Errore invio notifica a {f['user_id']}: {e}")
+                                            
+                    except Exception as e:
+                        logger.error(f"Errore recupero crediti per attore {person_id}: {e}")
+                        
+                    # Piccola pausa tra un attore e l'altro per non far bloccare TMDB (Rate Limit)
+                    await asyncio.sleep(1)
+                    
+        except Exception as e:
+            logger.error(f"Errore nel loop notifiche: {e}")
+            
+        # Ripeti il controllo ogni 24 ore (86400 secondi)
+        await asyncio.sleep(86400)
+
 @app.on_event("startup")
 async def startup_db():
     await db.users.create_index("user_id", unique=True)
@@ -1590,8 +1664,14 @@ async def startup_db():
     await db.shares.create_index("share_id", unique=True)
     await db.shares.create_index([("to_user_id", 1), ("read", 1), ("created_at", -1)])
     await db.public_reviews.create_index([("tmdb_id", 1), ("created_at", -1)])
-    # Indice per gli attori
     await db.user_people.create_index([("user_id", 1), ("person_id", 1)], unique=True)
+    
+    # --- NUOVO: Indice per non inviare doppie notifiche ---
+    await db.notifications_log.create_index([("person_id", 1), ("movie_id", 1)], unique=True)
+    
+    # --- NUOVO: Avvia il motore delle notifiche in background ---
+    asyncio.create_task(background_actor_checker())
+    
     logger.info("CineDiario backend ready")
 
 @app.on_event("shutdown")
