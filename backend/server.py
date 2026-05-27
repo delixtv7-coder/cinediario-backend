@@ -1458,6 +1458,21 @@ async def add_review_reply(request: Request, tmdb_id: int, review_id: str, req: 
     return {"ok": True, "reply": reply}
 
 @api_router.delete("/movies/{tmdb_id}/public-reviews/{review_id}")
+@limiter.limit("10/minute")
+async def delete_public_review(request: Request, tmdb_id: int, review_id: str, user: dict = Depends(get_current_user)):
+    review = await db.public_reviews.find_one({"review_id": review_id, "tmdb_id": tmdb_id})
+    
+    if not review:
+        raise HTTPException(status_code=404, detail="Recensione non trovata")
+    
+    if review.get("user_id") != user["user_id"]:
+        raise HTTPException(status_code=403, detail="Non puoi eliminare questa recensione")
+    
+    await db.public_reviews.delete_one({"review_id": review_id})
+    
+    return {"ok": True, "status": "deleted"}
+
+@api_router.delete("/movies/{tmdb_id}/public-reviews/{review_id}")
 @limiter.limit("20/minute")
 async def delete_review(request: Request, tmdb_id: int, review_id: str, user: dict = Depends(get_current_user)):
     # Elimina solo se la recensione appartiene all'utente
