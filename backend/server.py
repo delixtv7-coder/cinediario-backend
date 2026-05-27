@@ -677,7 +677,7 @@ async def user_stats(request: Request, user: dict = Depends(get_current_user)):
         "rating_distribution": rating_dist,
         "watched_minutes": sum_minutes,
         "watched_hours": round(sum_minutes / 60, 1),
-        "followed_actors": followed_actors, # VENGONO PASSATI AL PROFILO QUI!
+        "followed_actors": followed_actors, # ECCOLI QUI!
     }
 
 @api_router.get("/user/recommendations")
@@ -936,12 +936,10 @@ async def create_share(request: Request, req: ShareReq, user: dict = Depends(get
             if target_user:
                 token_dispositivo = target_user.get("push_token")
                 if token_dispositivo and token_dispositivo.startswith("ExponentPushToken"):
-                    # === INSERIAMO L'ID INVISIBILE ANCHE QUANDO UN AMICO TI MANDA UN FILM ===
                     payload = {
                         "to": token_dispositivo,
                         "title": "🎬 Nuovo film condiviso!",
-                        "body": f"{user.get('name', 'Qualcuno')} ti ha inviato un film.",
-                        "data": {"tmdb_id": req.tmdb_id, "type": "share"}
+                        "body": f"{user.get('name', 'Qualcuno')} ti ha inviato un film."
                     }
                     try:
                         await client.post("https://exp.host/--/api/v2/push/send", json=payload)
@@ -1631,12 +1629,11 @@ async def background_actor_checker():
                                         actor_name = f.get("name", "Un attore che segui")
                                         movie_title = movie.get("title", "un nuovo film")
                                         
-                                        # === INSERIAMO L'ID INVISIBILE AL TELEFONO! ===
+                                        # 5. Prepara e invia la notifica PUSH al telefono!
                                         payload = {
                                             "to": token,
                                             "title": f"🎬 Novità per {actor_name}!",
-                                            "body": f"È in arrivo '{movie_title}' (Uscita: {release_date}).",
-                                            "data": {"tmdb_id": movie_id, "type": "actor_new_movie"}
+                                            "body": f"È in arrivo '{movie_title}' (Uscita: {release_date})."
                                         }
                                         try:
                                             await client.post("https://exp.host/--/api/v2/push/send", json=payload)
@@ -1669,10 +1666,10 @@ async def startup_db():
     await db.public_reviews.create_index([("tmdb_id", 1), ("created_at", -1)])
     await db.user_people.create_index([("user_id", 1), ("person_id", 1)], unique=True)
     
-    # Indice per non inviare doppie notifiche
+    # --- NUOVO: Indice per non inviare doppie notifiche ---
     await db.notifications_log.create_index([("person_id", 1), ("movie_id", 1)], unique=True)
     
-    # Avvia il motore delle notifiche in background
+    # --- NUOVO: Avvia il motore delle notifiche in background ---
     asyncio.create_task(background_actor_checker())
     
     logger.info("CineDiario backend ready")
