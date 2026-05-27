@@ -1502,13 +1502,14 @@ async def get_public_reviews(request: Request, tmdb_id: int):
         is_anon = r.get("is_anonymous", False)
         out.append({
             "review_id": r["review_id"],
+            "user_id": r.get("user_id"), # <--- ECCO LA RIGA CHE MANCAVA!
             "text": r.get("text"),
             "rating": r.get("rating"),
             "created_at": r["created_at"].isoformat() if "created_at" in r else None,
             "user_name": "Utente Anonimo" if is_anon else r.get("user_name", "Utente"),
             "user_picture": None if is_anon else r.get("user_picture"),
             "is_anonymous": is_anon,
-            "replies": r.get("replies", []) # Ora il server invia anche le risposte
+            "replies": r.get("replies", [])
         })
     return {"reviews": out}
 
