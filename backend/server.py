@@ -150,20 +150,11 @@ class UpdateMovieReq(BaseModel):
     rating_cinematography: Optional[float] = None
 
 # ===== Helpers =====
-
-# -------------------------------------------------------------
-# IL FIX "OSPITI" È QUI! 
-# Serve per far apparire la scritta "Funzione Riservata" in Amici 
-# e il banner per registrarsi nel Profilo.
-# -------------------------------------------------------------
 def serialize_user(user: dict) -> dict:
-    # REGOLA D'ORO: Se non c'è l'email, l'utente è un ospite anonimo (Guest)
     email = user.get("email", "").strip()
-    
     if not email:
         is_guest = True
     else:
-        # Se c'è l'email, controlliamo i provider tradizionali
         is_guest = user.get("auth_provider_id") == "anonymous" or user.get("auth_provider") == "guest"
         
     return {
@@ -233,14 +224,9 @@ def _verify_firebase_token(id_token: str, client_ip: str) -> dict:
         except Exception as e:
             security_logger.error(f"AUTH_FAIL verify_error ip={client_ip} err={e}")
 
-    # FIX: Se stiamo usando il fallback tramite UID
     if 10 <= len(id_token) <= 200 and all(c.isalnum() or c in "-_" for c in id_token):
         try:
             ur = firebase_auth.get_user(id_token)
-            
-            # 🔥 FIX: Determiniamo il VERO provider dell'utente
-            # Se provider_data è vuoto, è un utente anonimo (ospite).
-            # Altrimenti prendiamo il provider reale (es. "password", "google.com")
             sign_in_provider = "anonymous"
             if ur.provider_data:
                 sign_in_provider = ur.provider_data[0].provider_id
@@ -253,7 +239,7 @@ def _verify_firebase_token(id_token: str, client_ip: str) -> dict:
                 "picture": ur.photo_url,
                 "aud": FIREBASE_PROJECT_ID,
                 "iss": expected_iss,
-                "firebase": {"sign_in_provider": sign_in_provider}, # Salviamo quello reale, NON "uid_compat"
+                "firebase": {"sign_in_provider": sign_in_provider},
             }
         except firebase_auth.UserNotFoundError:
             security_logger.warning(f"AUTH_FAIL unknown_uid ip={client_ip} uid_prefix={id_token[:8]}")
@@ -262,6 +248,7 @@ def _verify_firebase_token(id_token: str, client_ip: str) -> dict:
 
     security_logger.warning(f"AUTH_FAIL invalid_token ip={client_ip} len={len(id_token)} prefix={id_token[:20]}")
     raise HTTPException(status_code=401, detail="Invalid Firebase token")
+
 def _build_user_profile(decoded: dict) -> dict:
     uid = decoded.get("uid") or decoded.get("user_id")
     if not uid:
@@ -279,12 +266,9 @@ def _build_user_profile(decoded: dict) -> dict:
 async def _upsert_user(profile: dict) -> dict:
     uid = profile["uid"]
     now = datetime.now(timezone.utc)
-    
-    # Cerchiamo l'utente nel database MongoDB Atlas
     user = await db.users.find_one({"user_id": uid}, {"_id": 0})
     
     if not user:
-        # NUOVO UTENTE (Registrato o Ospite)
         user = {
             "user_id": uid,
             "email": profile["email"],
@@ -297,28 +281,21 @@ async def _upsert_user(profile: dict) -> dict:
             "last_login_at": now,
         }
         try:
-            # Generiamo e assegniamo IMMEDIATAMENTE il codice amico prima del salvataggio
             await ensure_friend_code(user)
             await db.users.insert_one(user)
             security_logger.info(f"AUTH_NEW_USER uid={uid} provider={profile.get('provider_id')}")
         except Exception:
             user = await db.users.find_one({"user_id": uid}, {"_id": 0}) or user
     else:
-        # UTENTE GIÀ ESISTENTE
         updates = {"last_login_at": now}
-        
-        # Se l'utente era ospite e ora si è registrato, aggiorniamo il suo provider di accesso
         if profile.get("provider_id") and user.get("auth_provider_id") != profile["provider_id"]:
             updates["auth_provider_id"] = profile["provider_id"]
-
         for key in ("name", "picture", "email", "email_verified"):
             if profile.get(key) and user.get(key) != profile[key]:
                 updates[key] = profile[key]
         
-        # Forza il controllo e il recupero del codice amico per l'utente esistente
         await ensure_friend_code(user)
         updates["friend_code"] = user["friend_code"]
-                
         await db.users.update_one({"user_id": uid}, {"$set": updates})
         user.update(updates)
         
@@ -446,17 +423,14 @@ async def fetch_watch_providers(tmdb_id: int, title: str) -> list:
             })
     return out
 
-# ===== Auth Routes =====
 @api_router.get("/auth/me")
 @limiter.limit("30/minute")
 async def auth_me(request: Request, user: dict = Depends(get_current_user)):
     return {"user": serialize_user(user)}
 
-# ===== USER MOVIES =====
 class PushTokenReq(BaseModel):
     token: str
 
-# FIX: Rimosso il prefisso /api di troppo nella stringa qui sotto
 @api_router.post("/user/push-token")
 @limiter.limit("5/minute")
 async def save_push_token(request: Request, req: PushTokenReq, user: dict = Depends(get_current_user)):
@@ -480,7 +454,6 @@ async def _movie_snapshot(tmdb_id: int) -> dict:
             "overview": details.get("overview"),
             "vote_average": details.get("vote_average", 0),
             "genres": [g.get("name") for g in details.get("genres", []) if g.get("name")],
-            # AGGIUNTA FONDAMENTALE PER LA NAZIONALITÀ
             "production_countries": [c.get("name") for c in details.get("production_countries", []) if c.get("name")],
             "runtime": details.get("runtime"),
         }
@@ -506,15 +479,14 @@ def _serialize_user_movie(doc: dict) -> dict:
         "movie": movie_obj,
         "created_at": (doc.get("created_at") or datetime.now(timezone.utc)).isoformat(),
         "updated_at": (doc.get("updated_at") or datetime.now(timezone.utc)).isoformat(),
-        # --- FIX: Esponiamo i dati in superficie per il Catalogo ---
         "genres": movie_obj.get("genres", []),
         "production_countries": movie_obj.get("production_countries", []),
         "release_date": movie_obj.get("release_date"),
     }
+
 @api_router.post("/user/movies/fix-metadata")
 @limiter.limit("5/minute")
 async def fix_old_movies_metadata(request: Request, user: dict = Depends(get_current_user)):
-    # Cerchiamo tutti i film dell'utente che non hanno le nazionalità salvate nel database
     cursor = db.user_movies.find({
         "user_id": user["user_id"],
         "$or": [
@@ -522,20 +494,15 @@ async def fix_old_movies_metadata(request: Request, user: dict = Depends(get_cur
             {"movie.production_countries": None}
         ]
     })
-    
     updated_count = 0
     async for doc in cursor:
         tmdb_id = doc["tmdb_id"]
-        # Scarichiamo lo snapshot aggiornato da TMDB (che ora include generi e nazionalità)
         new_snapshot = await _movie_snapshot(tmdb_id)
-        
-        # Aggiorniamo il documento nel database
         await db.user_movies.update_one(
             {"user_id": user["user_id"], "tmdb_id": tmdb_id},
             {"$set": {"movie": new_snapshot}}
         )
         updated_count += 1
-        
     return {"ok": True, "updated_count": updated_count}
 
 @api_router.get("/user/movies")
@@ -601,8 +568,6 @@ async def update_user_movie(request: Request, tmdb_id: int, req: UpdateMovieReq,
     merged = {**existing, **updates}
     updates["overall"] = compute_overall(merged)
     updates["updated_at"] = datetime.now(timezone.utc)
-    
-    # Auto-guarigione copertine per film vecchi
     if not existing.get("movie") or not existing.get("movie", {}).get("poster_url"):
         updates["movie"] = await _movie_snapshot(tmdb_id)
         
@@ -617,6 +582,43 @@ async def delete_user_movie(request: Request, tmdb_id: int, user: dict = Depends
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Film non presente nel diario")
     return {"ok": True}
+
+# ==========================================
+# GESTIONE ATTORI SEGUITI E STATISTICHE
+# ==========================================
+
+class FollowPersonReq(BaseModel):
+    name: str
+    profile_url: Optional[str] = None
+
+@api_router.post("/user/people/{person_id}/follow")
+@limiter.limit("20/minute")
+async def follow_person(request: Request, person_id: int, req: FollowPersonReq, user: dict = Depends(get_current_user)):
+    doc = {
+        "user_id": user["user_id"],
+        "person_id": person_id,
+        "name": req.name,
+        "profile_url": req.profile_url,
+        "created_at": datetime.now(timezone.utc)
+    }
+    await db.user_people.update_one(
+        {"user_id": user["user_id"], "person_id": person_id},
+        {"$set": doc},
+        upsert=True
+    )
+    return {"ok": True, "status": "followed"}
+
+@api_router.delete("/user/people/{person_id}/unfollow")
+@limiter.limit("20/minute")
+async def unfollow_person(request: Request, person_id: int, user: dict = Depends(get_current_user)):
+    await db.user_people.delete_one({"user_id": user["user_id"], "person_id": person_id})
+    return {"ok": True, "status": "unfollowed"}
+
+@api_router.get("/user/people/{person_id}/status")
+@limiter.limit("30/minute")
+async def check_person_status(request: Request, person_id: int, user: dict = Depends(get_current_user)):
+    doc = await db.user_people.find_one({"user_id": user["user_id"], "person_id": person_id})
+    return {"is_following": bool(doc)}
 
 @api_router.get("/user/stats")
 @limiter.limit("30/minute")
@@ -633,7 +635,6 @@ async def user_stats(request: Request, user: dict = Depends(get_current_user)):
         {"$match": {"user_id": user["user_id"], "status": "watched", "overall": {"$exists": True, "$ne": None}}},
         {"$group": {"_id": "$overall", "count": {"$sum": 1}}},
     ]
-    
     by_status = {}
     total = 0
     sum_minutes = 0
@@ -662,6 +663,10 @@ async def user_stats(request: Request, user: dict = Depends(get_current_user)):
         rt = ((d.get("movie") or {}).get("runtime")) or 0
         sum_minutes += rt
         
+    # RECUPERA GLI ATTORI SEGUITI E LI METTE NELLE STATISTICHE
+    followed_cursor = db.user_people.find({"user_id": user["user_id"]}, {"_id": 0}).sort("created_at", -1)
+    followed_actors = [doc async for doc in followed_cursor]
+        
     return {
         "total_watched": by_status.get("watched", {}).get("count", 0),
         "total_watchlist": by_status.get("watchlist", {}).get("count", 0),
@@ -671,12 +676,9 @@ async def user_stats(request: Request, user: dict = Depends(get_current_user)):
         "rating_distribution": rating_dist,
         "watched_minutes": sum_minutes,
         "watched_hours": round(sum_minutes / 60, 1),
+        "followed_actors": followed_actors, # ECCOLI QUI!
     }
 
-# -------------------------------------------------------------
-# IL FIX "HOME" È QUI! 
-# Se non hai votato nulla, manda il messaggio (e i pop anche per scorta)
-# -------------------------------------------------------------
 @api_router.get("/user/recommendations")
 @limiter.limit("20/minute")
 async def user_recommendations(request: Request, user: dict = Depends(get_current_user)):
@@ -690,7 +692,6 @@ async def user_recommendations(request: Request, user: dict = Depends(get_curren
     async for d in db.user_movies.find({"user_id": user["user_id"]}, {"_id": 0, "tmdb_id": 1}):
         already_ids.add(d["tmdb_id"])
 
-    # Se non c'è nessun voto o non ci sono film, ritorna i popolari ma AGGIUNGE il messaggio!
     if not seeds:
         data = await tmdb_get("/movie/popular", {"page": 1})
         recs = [fmt_movie(m) for m in data.get("results", []) if m.get("id") not in already_ids]
@@ -713,7 +714,6 @@ async def user_recommendations(request: Request, user: dict = Depends(get_curren
                 out.append(fmt_movie(m))
     return {"recommendations": out[:20]}
 
-# ===== FRIENDS =====
 def _friendship_key(a: str, b: str) -> dict:
     lo, hi = sorted([a, b])
     return {"user_lo": lo, "user_hi": hi}
@@ -739,8 +739,6 @@ async def list_friends(request: Request, user: dict = Depends(get_current_user))
     out = []
     async for fr in cursor:
         out.append(await _friend_profile(_other_user(fr, me)))
-        
-    # FIX: Mettiamo i dati nella "scatola" chiamata "friends" che l'app si aspetta!
     return {"friends": out}
 
 @api_router.get("/friends/requests")
@@ -754,21 +752,16 @@ async def list_friend_requests(request: Request, user: dict = Depends(get_curren
     )
     async for fr in cursor:
         other_profile = await _friend_profile(_other_user(fr, me))
-        
-        # FIX: Costruiamo la risposta usando gli ESATTI nomi che friends.tsx si aspetta!
         entry = {
             "request_id": fr.get("request_id"),
             "created_at": (fr.get("created_at") or datetime.now(timezone.utc)).isoformat(),
         }
-        
-        # Separiamo chi invia e chi riceve, proprio come vuole il frontend
         if fr.get("requested_by") == me:
             entry["to_user"] = other_profile
             outgoing.append(entry)
         else:
             entry["from_user"] = other_profile
             incoming.append(entry)
-            
     return {"incoming": incoming, "outgoing": outgoing}
 
 class FriendRequestReq(BaseModel):
@@ -778,8 +771,6 @@ class FriendRequestReq(BaseModel):
 @limiter.limit("10/minute")
 async def send_friend_request(request: Request, req: FriendRequestReq, user: dict = Depends(get_current_user)):
     code = req.friend_code.strip().upper()
-    
-    # 1. Recupero utente target
     target = await db.users.find_one({"friend_code": code})
     if not target:
         raise HTTPException(status_code=404, detail="Codice amico non trovato")
@@ -788,14 +779,12 @@ async def send_friend_request(request: Request, req: FriendRequestReq, user: dic
     if target_id == user["user_id"]:
         raise HTTPException(status_code=400, detail="Non puoi aggiungere te stesso")
 
-    # 2. Controllo amicizia esistente
     user_lo, user_hi = (user["user_id"], target_id) if user["user_id"] < target_id else (target_id, user["user_id"])
     existing = await db.friendships.find_one({"user_lo": user_lo, "user_hi": user_hi})
     
     if existing:
         raise HTTPException(status_code=400, detail="Relazione già esistente")
 
-    # 3. Inserimento nel database
     request_id = f"fr_{uuid.uuid4().hex[:12]}"
     await db.friendships.insert_one({
         "user_lo": user_lo,
@@ -806,13 +795,10 @@ async def send_friend_request(request: Request, req: FriendRequestReq, user: dic
         "created_at": datetime.now(timezone.utc),
     })
     
-    # 4. Recupero profilo in modo sicuro
     profile = await _friend_profile(target_id)
-    
-    # Se il profilo è None, restituiamo un oggetto di fallback invece di crashare
     safe_profile = profile if profile else {"name": "Utente", "user_id": target_id}
-        
     return {"ok": True, "request_id": request_id, "to": safe_profile}
+
 @api_router.post("/friends/requests/{request_id}/accept")
 @limiter.limit("30/minute")
 async def accept_friend_request(request: Request, request_id: str, user: dict = Depends(get_current_user)):
@@ -829,12 +815,11 @@ async def accept_friend_request(request: Request, request_id: str, user: dict = 
         {"$set": {"status": "accepted", "accepted_at": datetime.now(timezone.utc)}},
     )
     
-    # LO SCUDO ANTI-CRASH:
     other_id = _other_user(fr, me)
     profile = await _friend_profile(other_id)
     safe_profile = profile if profile else {"name": "Utente", "user_id": other_id}
-    
     return {"ok": True, "friend": safe_profile}
+
 @api_router.post("/friends/requests/{request_id}/decline")
 @limiter.limit("30/minute")
 async def decline_friend_request(request: Request, request_id: str, user: dict = Depends(get_current_user)):
@@ -856,11 +841,10 @@ async def remove_friend(request: Request, friend_user_id: str, user: dict = Depe
         raise HTTPException(status_code=404, detail="Amicizia non trovata")
     return {"ok": True}
 
-# ===== SHARES =====
 class ShareReq(BaseModel):
-    to_user_ids: List[str]  # Ora accetta una lista
+    to_user_ids: List[str] 
     tmdb_id: int
-    share_type: str = "recommendation"  # Aggiungiamo il tipo
+    share_type: str = "recommendation" 
     message: Optional[str] = None
 
 async def _are_friends(a: str, b: str) -> bool:
@@ -880,21 +864,18 @@ async def shares_inbox(request: Request, user: dict = Depends(get_current_user))
     cursor = db.shares.find({"to_user_id": user["user_id"]}, {"_id": 0}).sort("created_at", -1).limit(100)
     out = []
     async for s in cursor:
-        # Salvagente: recupera i dati del film sia se salvati col formato nuovo che col vecchio
         movie_data = s.get("movie_snapshot") or s.get("movie") or {}
-        
         out.append({
             "share_id": s["share_id"],
-            "from_user": await _friend_profile(s["from_user_id"]),   # FIX: from_user (non from)
+            "from_user": await _friend_profile(s["from_user_id"]),
             "tmdb_id": s["tmdb_id"],
-            "share_type": s.get("share_type", "recommendation"),     # FIX: mancava
-            "movie_snapshot": movie_data,                            # FIX: movie_snapshot (non movie)
-            "review_snapshot": s.get("review_snapshot"),             # FIX: mancava
+            "share_type": s.get("share_type", "recommendation"),
+            "movie_snapshot": movie_data,
+            "review_snapshot": s.get("review_snapshot"),
             "message": s.get("message"),
             "read": bool(s.get("read", False)),
             "created_at": (s.get("created_at") or datetime.now(timezone.utc)).isoformat(),
         })
-        
     return {"items": out}
 
 @api_router.post("/shares")
@@ -905,13 +886,11 @@ async def create_share(request: Request, req: ShareReq, user: dict = Depends(get
     if not req.to_user_ids:
         raise HTTPException(status_code=400, detail="Seleziona almeno un amico")
 
-    # Verifica amici
     me = user["user_id"]
     for tid in req.to_user_ids:
         if not await _are_friends(me, tid):
             raise HTTPException(status_code=403, detail="Puoi condividere solo con i tuoi amici")
 
-    # Snapshot film
     movie = await tmdb_get(f"/movie/{req.tmdb_id}")
     movie_snap = {
         "tmdb_id": movie.get("id"),
@@ -921,7 +900,6 @@ async def create_share(request: Request, req: ShareReq, user: dict = Depends(get
         "vote_average": movie.get("vote_average"),
     }
     
-    # Snapshot recensione se il tipo è review
     review_snap = None
     if req.share_type == "review":
         item = await db.user_movies.find_one({"user_id": me, "tmdb_id": req.tmdb_id, "status": "watched"})
@@ -936,7 +914,6 @@ async def create_share(request: Request, req: ShareReq, user: dict = Depends(get
                 "rating_cinematography": item.get("rating_cinematography"),
             }
 
-    # Creazione docs per ogni amico
     docs = [{
         "share_id": uuid.uuid4().hex,
         "from_user_id": me,
@@ -950,10 +927,8 @@ async def create_share(request: Request, req: ShareReq, user: dict = Depends(get
         "created_at": datetime.now(timezone.utc),
     } for tid in req.to_user_ids]
     
-    # Inserimento nel database
     await db.shares.insert_many(docs)
     
-    # === INVIO NOTIFICHE TRAMITE EXPO (DEFINITIVO ANCHE PER APK) ===
     async with httpx.AsyncClient() as client:
         for tid in req.to_user_ids:
             target_user = await db.users.find_one({"user_id": tid})
@@ -969,8 +944,6 @@ async def create_share(request: Request, req: ShareReq, user: dict = Depends(get
                         await client.post("https://exp.host/--/api/v2/push/send", json=payload)
                     except Exception as e:
                         logger.error(f"Errore invio notifica a {tid}: {e}")
-    # ===============================================================
-    
     return {"ok": True, "sent": len(docs)}
 
 @api_router.post("/shares/{share_id}/read")
@@ -984,7 +957,6 @@ async def mark_share_read(request: Request, share_id: str, user: dict = Depends(
         raise HTTPException(status_code=404, detail="Condivisione non trovata")
     return {"ok": True}
 
-# ===== AI MOVIE FINDER =====
 class MovieFinderReq(BaseModel):
     answers: dict
     free_text: Optional[str] = None
@@ -1064,7 +1036,6 @@ Non aggiungere testo prima o dopo il JSON, non usare markdown."""
             continue
     return {"movies": out}
 
-# ===== Health =====
 @api_router.get("/health")
 async def health():
     try:
@@ -1077,7 +1048,6 @@ async def health():
         "firebase": bool(firebase_admin._apps), "firebase_project_id": FIREBASE_PROJECT_ID,
     }
 
-# ===== TMDB Routes =====
 @api_router.get("/movies/popular")
 @limiter.limit("60/minute")
 async def movies_popular(request: Request):
@@ -1197,7 +1167,6 @@ async def person_details(request: Request, person_id: int):
         "filmography": _build_filmography(person),
     }
 
-# ===== Quiz =====
 def _extract_quiz_context(details: dict) -> dict:
     credits = details.get("credits", {}) or {}
     crew = credits.get("crew", []) or []
@@ -1381,10 +1350,6 @@ async def _cache_quiz(tmdb_id: int, payload: dict) -> None:
     except Exception:
         pass
 
-# ===== RECENSIONI PUBBLICHE (COMMUNITY) =====
-
-# ===== RECENSIONI PUBBLICHE E RISPOSTE (COMMUNITY) =====
-
 class PublicReviewReq(BaseModel):
     text: Optional[str] = None
     rating: Optional[float] = None
@@ -1400,12 +1365,10 @@ async def add_public_review(request: Request, tmdb_id: int, req: PublicReviewReq
         raise HTTPException(status_code=403, detail="Crea un account per lasciare recensioni pubbliche")
     
     text_stripped = req.text.strip() if req.text else ""
-    
     if not text_stripped and req.rating is None:
         raise HTTPException(status_code=400, detail="Inserisci un voto o un commento")
         
     now = datetime.now(timezone.utc)
-    
     review_doc = {
         "review_id": uuid.uuid4().hex,
         "tmdb_id": tmdb_id,
@@ -1416,7 +1379,6 @@ async def add_public_review(request: Request, tmdb_id: int, req: PublicReviewReq
         "rating": req.rating,
         "is_anonymous": req.is_anonymous,
         "created_at": now
-        # Le "replies" verranno create in automatico al primo commento
     }
     
     await db.public_reviews.update_one(
@@ -1424,7 +1386,6 @@ async def add_public_review(request: Request, tmdb_id: int, req: PublicReviewReq
         {"$set": review_doc},
         upsert=True
     )
-    
     return {"ok": True}
 
 @api_router.post("/movies/{tmdb_id}/public-reviews/{review_id}/reply")
@@ -1445,37 +1406,19 @@ async def add_review_reply(request: Request, tmdb_id: int, review_id: str, req: 
         "text": text_stripped[:500],
         "created_at": datetime.now(timezone.utc).isoformat()
     }
-
-    # $push inserisce la risposta dentro l'array "replies" della recensione genitore
     result = await db.public_reviews.update_one(
         {"tmdb_id": tmdb_id, "review_id": review_id},
         {"$push": {"replies": reply}}
     )
-
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Recensione non trovata")
 
     return {"ok": True, "reply": reply}
 
-@api_router.delete("/movies/{tmdb_id}/public-reviews/{review_id}")
-@limiter.limit("10/minute")
-async def delete_public_review(request: Request, tmdb_id: int, review_id: str, user: dict = Depends(get_current_user)):
-    review = await db.public_reviews.find_one({"review_id": review_id, "tmdb_id": tmdb_id})
-    
-    if not review:
-        raise HTTPException(status_code=404, detail="Recensione non trovata")
-    
-    if review.get("user_id") != user["user_id"]:
-        raise HTTPException(status_code=403, detail="Non puoi eliminare questa recensione")
-    
-    await db.public_reviews.delete_one({"review_id": review_id})
-    
-    return {"ok": True, "status": "deleted"}
-
+# UNICA VERSIONE DI DELETE_REVIEW
 @api_router.delete("/movies/{tmdb_id}/public-reviews/{review_id}")
 @limiter.limit("20/minute")
 async def delete_review(request: Request, tmdb_id: int, review_id: str, user: dict = Depends(get_current_user)):
-    # Elimina solo se la recensione appartiene all'utente
     result = await db.public_reviews.delete_one({"review_id": review_id, "user_id": user["user_id"]})
     if result.deleted_count == 0:
         raise HTTPException(status_code=403, detail="Non puoi eliminare questa recensione")
@@ -1484,9 +1427,8 @@ async def delete_review(request: Request, tmdb_id: int, review_id: str, user: di
 @api_router.delete("/movies/{tmdb_id}/public-reviews/{review_id}/reply/{reply_id}")
 @limiter.limit("20/minute")
 async def delete_reply(request: Request, tmdb_id: int, review_id: str, reply_id: str, user: dict = Depends(get_current_user)):
-    # Rimuove la risposta specifica dall'array
     result = await db.public_reviews.update_one(
-        {"review_id": review_id, "user_id": {"$ne": None}}, # Verifiche base
+        {"review_id": review_id, "user_id": {"$ne": None}}, 
         {"$pull": {"replies": {"reply_id": reply_id, "user_id": user["user_id"]}}}
     )
     if result.modified_count == 0:
@@ -1502,7 +1444,7 @@ async def get_public_reviews(request: Request, tmdb_id: int):
         is_anon = r.get("is_anonymous", False)
         out.append({
             "review_id": r["review_id"],
-            "user_id": r.get("user_id"), # <--- ECCO LA RIGA CHE MANCAVA!
+            "user_id": r.get("user_id"),
             "text": r.get("text"),
             "rating": r.get("rating"),
             "created_at": r["created_at"].isoformat() if "created_at" in r else None,
@@ -1513,45 +1455,105 @@ async def get_public_reviews(request: Request, tmdb_id: int):
         })
     return {"reviews": out}
 
-@api_router.get("/quiz/{tmdb_id}")
+# ===== GESTIONE ATTORI SEGUITI E STATISTICHE =====
+class FollowPersonReq(BaseModel):
+    name: str
+    profile_url: Optional[str] = None
+
+@api_router.post("/user/people/{person_id}/follow")
 @limiter.limit("20/minute")
-async def movie_quiz(request: Request, tmdb_id: int):
-    if tmdb_id <= 0 or tmdb_id > 10_000_000:
-        raise HTTPException(status_code=400, detail="tmdb_id non valido")
-    cached = await db.movie_quizzes.find_one(
-        {"tmdb_id": tmdb_id, "lang": "it", "version": 2}, {"_id": 0}
+async def follow_person(request: Request, person_id: int, req: FollowPersonReq, user: dict = Depends(get_current_user)):
+    doc = {
+        "user_id": user["user_id"],
+        "person_id": person_id,
+        "name": req.name,
+        "profile_url": req.profile_url,
+        "created_at": datetime.now(timezone.utc)
+    }
+    await db.user_people.update_one(
+        {"user_id": user["user_id"], "person_id": person_id},
+        {"$set": doc},
+        upsert=True
     )
-    if cached:
-        return cached.get("payload", cached)
-    try:
-        details = await tmdb_get(f"/movie/{tmdb_id}", {"append_to_response": "credits,keywords"})
-    except HTTPException:
-        raise HTTPException(status_code=404, detail="Film non trovato")
+    return {"ok": True, "status": "followed"}
 
-    ctx = _extract_quiz_context(details)
-    
-    if not ctx.get("overview") or len(ctx["overview"]) < 30:
-        try:
-            en_details = await tmdb_get(f"/movie/{tmdb_id}", {"language": "en-US"})
-            ctx["overview"] = (en_details.get("overview") or "").strip()
-        except Exception:
-            pass
-            
-    if not ctx.get("overview") or len(ctx["overview"]) < 30:
-        return _empty_quiz_payload(ctx, tmdb_id)
+@api_router.delete("/user/people/{person_id}/unfollow")
+@limiter.limit("20/minute")
+async def unfollow_person(request: Request, person_id: int, user: dict = Depends(get_current_user)):
+    await db.user_people.delete_one({"user_id": user["user_id"], "person_id": person_id})
+    return {"ok": True, "status": "unfollowed"}
 
-    raw = await _call_llm_for_quiz(tmdb_id, _build_quiz_prompt(ctx))
-    parsed = _parse_llm_json(raw)
-    payload = _normalize_quiz_payload(parsed, ctx, tmdb_id)
-    await _cache_quiz(tmdb_id, payload)
-    return payload
+@api_router.get("/user/people/{person_id}/status")
+@limiter.limit("30/minute")
+async def check_person_status(request: Request, person_id: int, user: dict = Depends(get_current_user)):
+    doc = await db.user_people.find_one({"user_id": user["user_id"], "person_id": person_id})
+    return {"is_following": bool(doc)}
 
-# Modifica da api_router.get("/") a app.get("/")
-@app.get("/")         # <--- Sostituisci "api_router" con "app"
+@api_router.get("/user/stats")
+@limiter.limit("30/minute")
+async def user_stats(request: Request, user: dict = Depends(get_current_user)):
+    pipeline = [
+        {"$match": {"user_id": user["user_id"]}},
+        {"$group": {
+            "_id": "$status",
+            "count": {"$sum": 1},
+            "avg_rating": {"$avg": "$overall"},
+        }},
+    ]
+    dist_pipeline = [
+        {"$match": {"user_id": user["user_id"], "status": "watched", "overall": {"$exists": True, "$ne": None}}},
+        {"$group": {"_id": "$overall", "count": {"$sum": 1}}},
+    ]
+    by_status = {}
+    total = 0
+    sum_minutes = 0
+    async for row in db.user_movies.aggregate(pipeline):
+        by_status[row["_id"] or "unknown"] = {
+            "count": row["count"],
+            "avg_rating": round(row["avg_rating"], 2) if row["avg_rating"] else None,
+        }
+        total += row["count"]
+        
+    rating_dist = {}
+    async for row in db.user_movies.aggregate(dist_pipeline):
+        val = row.get("_id")
+        if val is not None:
+            try:
+                bucket = str(int(float(val)))
+                rating_dist[bucket] = rating_dist.get(bucket, 0) + row.get("count", 0)
+            except (ValueError, TypeError):
+                pass
+
+    runtime_cursor = db.user_movies.find(
+        {"user_id": user["user_id"], "status": "watched"},
+        {"_id": 0, "movie.runtime": 1},
+    )
+    async for d in runtime_cursor:
+        rt = ((d.get("movie") or {}).get("runtime")) or 0
+        sum_minutes += rt
+        
+    # RECUPERA GLI ATTORI SEGUITI
+    followed_cursor = db.user_people.find({"user_id": user["user_id"]}, {"_id": 0}).sort("created_at", -1)
+    followed_actors = [doc async for doc in followed_cursor]
+        
+    return {
+        "total_watched": by_status.get("watched", {}).get("count", 0),
+        "total_watchlist": by_status.get("watchlist", {}).get("count", 0),
+        "average_rating": by_status.get("watched", {}).get("avg_rating"),
+        "total": total,
+        "by_status": by_status,
+        "rating_distribution": rating_dist,
+        "watched_minutes": sum_minutes,
+        "watched_hours": round(sum_minutes / 60, 1),
+        "followed_actors": followed_actors,
+    }
+
+@app.get("/")
 async def root():
     return {"message": "CineDiario API", "status": "ok"}
 
-app.include_router(api_router)  # <--- Questa riga DEVE RIMANERE!
+app.include_router(api_router)
+
 if ALLOWED_HOSTS and ALLOWED_HOSTS != ["*"]:
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
 
@@ -1588,7 +1590,9 @@ async def startup_db():
     await db.shares.create_index("share_id", unique=True)
     await db.shares.create_index([("to_user_id", 1), ("read", 1), ("created_at", -1)])
     await db.public_reviews.create_index([("tmdb_id", 1), ("created_at", -1)])
-    logger.info("CineDiario backend ready (Firebase Auth + MongoDB Atlas + Security hardened)")
+    # Indice per gli attori
+    await db.user_people.create_index([("user_id", 1), ("person_id", 1)], unique=True)
+    logger.info("CineDiario backend ready")
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
