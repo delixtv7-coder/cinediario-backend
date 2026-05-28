@@ -1293,15 +1293,27 @@ def _parse_llm_json(raw: str) -> dict:
             raise HTTPException(status_code=502, detail="Risposta AI non valida")
 
 def _normalize_quiz_payload(parsed: dict, ctx: dict, tmdb_id: int) -> dict:
+    import random
     questions = []
     for q in (parsed.get("questions") or [])[:5]:
+        options = [str(o) for o in (q.get("options") or [])[:4]]
+        
+        old_idx = q.get("correct_index")
+        if not isinstance(old_idx, int) or old_idx < 0 or old_idx >= len(options):
+            old_idx = 0
+            
+        correct_text = options[old_idx] if options else ""
+        random.shuffle(options)
+        new_idx = options.index(correct_text) if correct_text in options else 0
+        
         questions.append({
             "id": f"plot_{len(questions) + 1}",
             "question": (q.get("question") or "").strip(),
-            "options": [str(o) for o in (q.get("options") or [])[:4]],
-            "correct_index": q.get("correct_index"),
+            "options": options,
+            "correct_index": new_idx,
             "explanation": (q.get("explanation") or "").strip(),
         })
+        
     recap_in = parsed.get("recap") or {}
     recap = {
         "intro": ctx["title"],
@@ -1343,7 +1355,7 @@ async def _cache_quiz(tmdb_id: int, payload: dict) -> None:
         await db.movie_quizzes.update_one(
             {"tmdb_id": tmdb_id, "lang": "it"},
             {"$set": {
-                "tmdb_id": tmdb_id, "lang": "it", "version": 2,
+                "tmdb_id": tmdb_id, "lang": "it", "version": 3,
                 "payload": payload, "generated_at": datetime.now(timezone.utc),
             }},
             upsert=True,
@@ -1558,9 +1570,9 @@ async def movie_quiz(request: Request, tmdb_id: int):
     if tmdb_id <= 0 or tmdb_id > 10_000_000:
         raise HTTPException(status_code=400, detail="tmdb_id non valido")
     
-    # Controlla se il quiz è già salvato nel database
+    # Controlla se il quiz è già salvato nel database (cerchiamo la version 3)
     cached = await db.movie_quizzes.find_one(
-        {"tmdb_id": tmdb_id, "lang": "it", "version": 2}, {"_id": 0}
+        {"tmdb_id": tmdb_id, "lang": "it", "version": 3}, {"_id": 0}
     )
     if cached:
         return cached.get("payload", cached)
