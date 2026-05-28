@@ -1549,6 +1549,50 @@ async def user_stats(request: Request, user: dict = Depends(get_current_user)):
         "followed_actors": followed_actors,
     }
 
+# ==========================================
+# ROTTA PER IL QUIZ
+# ==========================================
+@api_router.get("/quiz/{tmdb_id}")
+@limiter.limit("20/minute")
+async def movie_quiz(request: Request, tmdb_id: int):
+    if tmdb_id <= 0 or tmdb_id > 10_000_000:
+        raise HTTPException(status_code=400, detail="tmdb_id non valido")
+    
+    # Controlla se il quiz è già salvato nel database
+    cached = await db.movie_quizzes.find_one(
+        {"tmdb_id": tmdb_id, "lang": "it", "version": 2}, {"_id": 0}
+    )
+    if cached:
+        return cached.get("payload", cached)
+        
+    try:
+        details = await tmdb_get(f"/movie/{tmdb_id}", {"append_to_response": "credits,keywords"})
+    except HTTPException:
+        raise HTTPException(status_code=404, detail="Film non trovato")
+
+    ctx = _extract_quiz_context(details)
+    
+    # Se la trama in italiano è troppo corta, prova a prenderla in inglese
+    if not ctx.get("overview") or len(ctx["overview"]) < 30:
+        try:
+            en_details = await tmdb_get(f"/movie/{tmdb_id}", {"language": "en-US"})
+            ctx["overview"] = (en_details.get("overview") or "").strip()
+        except Exception:
+            pass
+            
+    # Se non c'è proprio trama, restituisce un quiz vuoto per non far crashare l'app
+    if not ctx.get("overview") or len(ctx["overview"]) < 30:
+        return _empty_quiz_payload(ctx, tmdb_id)
+
+    # Chiama Gemini per generare il quiz
+    raw = await _call_llm_for_quiz(tmdb_id, _build_quiz_prompt(ctx))
+    parsed = _parse_llm_json(raw)
+    payload = _normalize_quiz_payload(parsed, ctx, tmdb_id)
+    
+    # Salva il quiz per la prossima volta
+    await _cache_quiz(tmdb_id, payload)
+    return payload
+
 @app.get("/")
 async def root():
     return {"message": "CineDiario API", "status": "ok"}
