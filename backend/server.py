@@ -677,7 +677,7 @@ async def user_stats(request: Request, user: dict = Depends(get_current_user)):
         "rating_distribution": rating_dist,
         "watched_minutes": sum_minutes,
         "watched_hours": round(sum_minutes / 60, 1),
-        "followed_actors": followed_actors,
+        "followed_actors": followed_actors, # ECCOLI QUI!
     }
 
 @api_router.get("/user/recommendations")
@@ -939,8 +939,7 @@ async def create_share(request: Request, req: ShareReq, user: dict = Depends(get
                     payload = {
                         "to": token_dispositivo,
                         "title": "🎬 Nuovo film condiviso!",
-                        "body": f"{user.get('name', 'Qualcuno')} ti ha inviato un film.",
-                        "data": {"tmdb_id": req.tmdb_id}
+                        "body": f"{user.get('name', 'Qualcuno')} ti ha inviato un film."
                     }
                     try:
                         await client.post("https://exp.host/--/api/v2/push/send", json=payload)
@@ -1245,7 +1244,6 @@ FORMATO DI RISPOSTA (JSON ESATTO):
 
 Restituisci SOLO l'oggetto JSON valido.
 """
-
 async def _call_llm_for_quiz(tmdb_id: int, prompt: str) -> str:
     if not GEMINI_API_KEY:
         raise HTTPException(status_code=500, detail="LLM non configurato")
@@ -1257,16 +1255,27 @@ async def _call_llm_for_quiz(tmdb_id: int, prompt: str) -> str:
         "systemInstruction": {"parts": [{"text": system_msg}]},
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.7, "responseMimeType": "application/json"},
+        "safetySettings": [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
+        ]
     }
     try:
-        async with httpx.AsyncClient(timeout=30.0) as c:
+        # Aumentato il timeout a 45 secondi nel caso in cui Gemini sia un po' lento
+        async with httpx.AsyncClient(timeout=45.0) as c:
             r = await c.post(GEMINI_URL, params={"key": GEMINI_API_KEY}, json=body)
         if r.status_code != 200:
+            logger.error(f"Errore Gemini API: {r.text}")
             raise HTTPException(status_code=502, detail="Impossibile generare il quiz")
         data = r.json()
+        
         candidates = data.get("candidates") or []
         if not candidates:
-            raise HTTPException(status_code=502, detail="Nessuna risposta dall'AI")
+            logger.error(f"Risposta bloccata dai filtri: {data}")
+            raise HTTPException(status_code=502, detail="Nessuna risposta dall'AI (Filtri)")
+            
         parts = (candidates[0].get("content") or {}).get("parts") or []
         text = "".join(p.get("text", "") for p in parts)
         if not text:
@@ -1275,6 +1284,7 @@ async def _call_llm_for_quiz(tmdb_id: int, prompt: str) -> str:
     except HTTPException:
         raise
     except Exception as e:
+        logger.error(f"Errore connessione LLM: {e}")
         raise HTTPException(status_code=502, detail="Impossibile generare il quiz")
 
 def _parse_llm_json(raw: str) -> dict:
@@ -1294,15 +1304,27 @@ def _parse_llm_json(raw: str) -> dict:
             raise HTTPException(status_code=502, detail="Risposta AI non valida")
 
 def _normalize_quiz_payload(parsed: dict, ctx: dict, tmdb_id: int) -> dict:
+    import random
     questions = []
     for q in (parsed.get("questions") or [])[:5]:
+        options = [str(o) for o in (q.get("options") or [])[:4]]
+        
+        old_idx = q.get("correct_index")
+        if not isinstance(old_idx, int) or old_idx < 0 or old_idx >= len(options):
+            old_idx = 0
+            
+        correct_text = options[old_idx] if options else ""
+        random.shuffle(options)
+        new_idx = options.index(correct_text) if correct_text in options else 0
+        
         questions.append({
             "id": f"plot_{len(questions) + 1}",
             "question": (q.get("question") or "").strip(),
-            "options": [str(o) for o in (q.get("options") or [])[:4]],
-            "correct_index": q.get("correct_index"),
+            "options": options,
+            "correct_index": new_idx,
             "explanation": (q.get("explanation") or "").strip(),
         })
+        
     recap_in = parsed.get("recap") or {}
     recap = {
         "intro": ctx["title"],
@@ -1344,7 +1366,7 @@ async def _cache_quiz(tmdb_id: int, payload: dict) -> None:
         await db.movie_quizzes.update_one(
             {"tmdb_id": tmdb_id, "lang": "it"},
             {"$set": {
-                "tmdb_id": tmdb_id, "lang": "it", "version": 2,
+                "tmdb_id": tmdb_id, "lang": "it", "version": 3,
                 "payload": payload, "generated_at": datetime.now(timezone.utc),
             }},
             upsert=True,
@@ -1534,7 +1556,7 @@ async def user_stats(request: Request, user: dict = Depends(get_current_user)):
         rt = ((d.get("movie") or {}).get("runtime")) or 0
         sum_minutes += rt
         
-    # RECUPERA GLI ATTORI SEGUITI E LI METTE NELLE STATISTICHE
+    # RECUPERA GLI ATTORI SEGUITI
     followed_cursor = db.user_people.find({"user_id": user["user_id"]}, {"_id": 0}).sort("created_at", -1)
     followed_actors = [doc async for doc in followed_cursor]
         
@@ -1549,6 +1571,50 @@ async def user_stats(request: Request, user: dict = Depends(get_current_user)):
         "watched_hours": round(sum_minutes / 60, 1),
         "followed_actors": followed_actors,
     }
+
+# ==========================================
+# ROTTA PER IL QUIZ
+# ==========================================
+@api_router.get("/quiz/{tmdb_id}")
+@limiter.limit("20/minute")
+async def movie_quiz(request: Request, tmdb_id: int):
+    if tmdb_id <= 0 or tmdb_id > 10_000_000:
+        raise HTTPException(status_code=400, detail="tmdb_id non valido")
+    
+    # Controlla se il quiz è già salvato nel database (cerchiamo la version 3)
+    cached = await db.movie_quizzes.find_one(
+        {"tmdb_id": tmdb_id, "lang": "it", "version": 3}, {"_id": 0}
+    )
+    if cached:
+        return cached.get("payload", cached)
+        
+    try:
+        details = await tmdb_get(f"/movie/{tmdb_id}", {"append_to_response": "credits,keywords"})
+    except HTTPException:
+        raise HTTPException(status_code=404, detail="Film non trovato")
+
+    ctx = _extract_quiz_context(details)
+    
+    # Se la trama in italiano è troppo corta, prova a prenderla in inglese
+    if not ctx.get("overview") or len(ctx["overview"]) < 30:
+        try:
+            en_details = await tmdb_get(f"/movie/{tmdb_id}", {"language": "en-US"})
+            ctx["overview"] = (en_details.get("overview") or "").strip()
+        except Exception:
+            pass
+            
+    # Se non c'è proprio trama, restituisce un quiz vuoto per non far crashare l'app
+    if not ctx.get("overview") or len(ctx["overview"]) < 30:
+        return _empty_quiz_payload(ctx, tmdb_id)
+
+    # Chiama Gemini per generare il quiz
+    raw = await _call_llm_for_quiz(tmdb_id, _build_quiz_prompt(ctx))
+    parsed = _parse_llm_json(raw)
+    payload = _normalize_quiz_payload(parsed, ctx, tmdb_id)
+    
+    # Salva il quiz per la prossima volta
+    await _cache_quiz(tmdb_id, payload)
+    return payload
 
 @app.get("/")
 async def root():
@@ -1634,8 +1700,7 @@ async def background_actor_checker():
                                         payload = {
                                             "to": token,
                                             "title": f"🎬 Novità per {actor_name}!",
-                                            "body": f"È in arrivo '{movie_title}' (Uscita: {release_date}).",
-                                            "data": {"tmdb_id": movie_id}
+                                            "body": f"È in arrivo '{movie_title}' (Uscita: {release_date})."
                                         }
                                         try:
                                             await client.post("https://exp.host/--/api/v2/push/send", json=payload)
