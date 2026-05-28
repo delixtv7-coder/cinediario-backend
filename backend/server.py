@@ -1244,7 +1244,6 @@ FORMATO DI RISPOSTA (JSON ESATTO):
 
 Restituisci SOLO l'oggetto JSON valido.
 """
-
 async def _call_llm_for_quiz(tmdb_id: int, prompt: str) -> str:
     if not GEMINI_API_KEY:
         raise HTTPException(status_code=500, detail="LLM non configurato")
@@ -1256,16 +1255,27 @@ async def _call_llm_for_quiz(tmdb_id: int, prompt: str) -> str:
         "systemInstruction": {"parts": [{"text": system_msg}]},
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.7, "responseMimeType": "application/json"},
+        "safetySettings": [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
+        ]
     }
     try:
-        async with httpx.AsyncClient(timeout=30.0) as c:
+        # Aumentato il timeout a 45 secondi nel caso in cui Gemini sia un po' lento
+        async with httpx.AsyncClient(timeout=45.0) as c:
             r = await c.post(GEMINI_URL, params={"key": GEMINI_API_KEY}, json=body)
         if r.status_code != 200:
+            logger.error(f"Errore Gemini API: {r.text}")
             raise HTTPException(status_code=502, detail="Impossibile generare il quiz")
         data = r.json()
+        
         candidates = data.get("candidates") or []
         if not candidates:
-            raise HTTPException(status_code=502, detail="Nessuna risposta dall'AI")
+            logger.error(f"Risposta bloccata dai filtri: {data}")
+            raise HTTPException(status_code=502, detail="Nessuna risposta dall'AI (Filtri)")
+            
         parts = (candidates[0].get("content") or {}).get("parts") or []
         text = "".join(p.get("text", "") for p in parts)
         if not text:
@@ -1274,6 +1284,7 @@ async def _call_llm_for_quiz(tmdb_id: int, prompt: str) -> str:
     except HTTPException:
         raise
     except Exception as e:
+        logger.error(f"Errore connessione LLM: {e}")
         raise HTTPException(status_code=502, detail="Impossibile generare il quiz")
 
 def _parse_llm_json(raw: str) -> dict:
