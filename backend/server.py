@@ -735,6 +735,52 @@ async def get_friend_profile(request: Request, friend_id: str, user: dict = Depe
         "followed_actors": followed_actors
     }
 
+# ==========================================
+# AVATAR DA TMDB
+# ==========================================
+
+class AvatarReq(BaseModel):
+    picture_url: str
+
+@api_router.post("/user/avatar")
+@limiter.limit("10/minute")
+async def update_avatar(request: Request, req: AvatarReq, user: dict = Depends(get_current_user)):
+    # Aggiorna il campo 'picture' nel documento dell'utente
+    await db.users.update_one(
+        {"user_id": user["user_id"]},
+        {"$set": {"picture": req.picture_url}}
+    )
+    return {"ok": True, "picture": req.picture_url}
+
+@api_router.get("/search-avatar")
+@limiter.limit("20/minute")
+async def search_avatar(request: Request, q: str, user: dict = Depends(get_current_user)):
+    import httpx
+    import os
+    
+    # Effettua una ricerca combinata (Film e Persone) direttamente su TMDB
+    api_key = os.getenv("TMDB_API_KEY")
+    url = f"https://api.themoviedb.org/3/search/multi?api_key={api_key}&query={q}&language=it-IT&page=1"
+    
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url)
+        data = resp.json()
+        
+    results = []
+    for item in data.get("results", []):
+        if item.get("media_type") in ["movie", "person"]:
+            # Prende il poster se è un film, o la foto profilo se è un attore
+            path = item.get("profile_path") if item.get("media_type") == "person" else item.get("poster_path")
+            if path:
+                results.append({
+                    "id": item.get("id"),
+                    "name": item.get("title") if item.get("media_type") == "movie" else item.get("name"),
+                    "type": "Film" if item.get("media_type") == "movie" else "Persona",
+                    "image_url": f"https://image.tmdb.org/t/p/w200{path}"
+                })
+                
+    return {"results": results[:12]}
+
 @api_router.get("/user/stats")
 @limiter.limit("30/minute")
 async def user_stats(request: Request, user: dict = Depends(get_current_user)):
