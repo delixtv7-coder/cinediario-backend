@@ -755,16 +755,11 @@ async def update_avatar(request: Request, req: AvatarReq, user: dict = Depends(g
 @api_router.get("/search-avatar")
 @limiter.limit("20/minute")
 async def search_avatar(request: Request, q: str, user: dict = Depends(get_current_user)):
-    import httpx
-    import os
-    
-    # Effettua una ricerca combinata (Film e Persone) direttamente su TMDB
-    api_key = os.getenv("TMDB_API_KEY")
-    url = f"https://api.themoviedb.org/3/search/multi?api_key={api_key}&query={q}&language=it-IT&page=1"
-    
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(url)
-        data = resp.json()
+    # Usiamo il nostro motore tmdb_get che ha già le chiavi segrete e la Cache integrata!
+    try:
+        data = await tmdb_get("/search/multi", {"query": q, "page": "1"})
+    except Exception as e:
+        return {"results": []}
         
     results = []
     for item in data.get("results", []):
