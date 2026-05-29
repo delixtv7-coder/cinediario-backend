@@ -755,16 +755,15 @@ async def update_avatar(request: Request, req: AvatarReq, user: dict = Depends(g
 @api_router.get("/search-avatar")
 @limiter.limit("20/minute")
 async def search_avatar(request: Request, q: str, user: dict = Depends(get_current_user)):
-    # Usiamo il nostro motore tmdb_get che ha già le chiavi segrete e la Cache integrata!
+    # 1. Cerchiamo normalmente su TMDB
     try:
         data = await tmdb_get("/search/multi", {"query": q, "page": "1"})
     except Exception as e:
-        return {"results": []}
+        data = {"results": []}
         
     results = []
     for item in data.get("results", []):
         if item.get("media_type") in ["movie", "person"]:
-            # Prende il poster se è un film, o la foto profilo se è un attore
             path = item.get("profile_path") if item.get("media_type") == "person" else item.get("poster_path")
             if path:
                 results.append({
@@ -774,7 +773,24 @@ async def search_avatar(request: Request, q: str, user: dict = Depends(get_curre
                     "image_url": f"https://image.tmdb.org/t/p/w200{path}"
                 })
                 
-    return {"results": results[:12]}
+    suggestion = None
+    
+    # 2. IL TRUCCO WIKIPEDIA: Se TMDB non ha trovato nulla, chiediamo a Wikipedia un suggerimento
+    if not results:
+        import httpx
+        try:
+            # L'API di Wikipedia con 'srinfo=suggestion' ci dà l'autocorrettore gratis e senza API key
+            wiki_url = f"https://it.wikipedia.org/w/api.php?action=query&list=search&srsearch={q}&srinfo=suggestion&format=json"
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                w_resp = await client.get(wiki_url)
+                w_data = w_resp.json()
+                # Se Wikipedia ci suggerisce un nome corretto, lo peschiamo!
+                suggestion = w_data.get("query", {}).get("searchinfo", {}).get("suggestion")
+        except Exception:
+            pass # Se Wikipedia non risponde, fa niente, non facciamo crashare l'app
+            
+    # Restituiamo sia i risultati (che sono vuoti) sia l'eventuale suggerimento
+    return {"results": results[:12], "suggestion": suggestion}
 
 @api_router.get("/user/stats")
 @limiter.limit("30/minute")
