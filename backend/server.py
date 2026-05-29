@@ -775,27 +775,38 @@ async def search_avatar(request: Request, q: str, user: dict = Depends(get_curre
                 
     suggestion = None
     
-    # 2. IL TRUCCO WIKIPEDIA (Potenziato!)
+    # 2. IL TRUCCO WIKIPEDIA (Con il "Documento di Identità")
     if not results:
         import httpx
         import urllib.parse
         try:
-            # Codifichiamo la parola per internet (gestisce spazi e caratteri strani)
             safe_q = urllib.parse.quote(q)
+            # Usiamo Wikipedia Italia per avere correzioni migliori sui nomi
+            wiki_url = f"https://it.wikipedia.org/w/api.php?action=query&list=search&srsearch={safe_q}&srinfo=suggestion&format=json"
             
-            # ATTENZIONE: Usiamo en.wikipedia.org (Inglese) che ha un autocorrettore potentissimo!
-            wiki_url = f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={safe_q}&srinfo=suggestion&format=json"
+            # IL DOCUMENTO D'IDENTITÀ: Senza questo, Wikipedia ci blocca credendoci degli hacker!
+            headers = {
+                "User-Agent": "CineDiarioApp/1.0 (info@cinediario.app)"
+            }
             
-            async with httpx.AsyncClient(timeout=2.0) as client:
+            # Mandiamo la richiesta a Wikipedia presentando il documento
+            async with httpx.AsyncClient(timeout=3.0, headers=headers) as client:
                 w_resp = await client.get(wiki_url)
-                w_data = w_resp.json()
-                suggestion = w_data.get("query", {}).get("searchinfo", {}).get("suggestion")
                 
-                # Piccola finezza: se il suggerimento lo trova, facciamo la prima lettera maiuscola per estetica
-                if suggestion:
-                    suggestion = suggestion.title()
-        except Exception:
-            pass # Ignoriamo in silenzio se Wikipedia è offline
+                # Se Wikipedia ci accetta, peschiamo il suggerimento
+                if w_resp.status_code == 200:
+                    w_data = w_resp.json()
+                    suggestion = w_data.get("query", {}).get("searchinfo", {}).get("suggestion")
+                    
+                    # Estetica: prima lettera maiuscola
+                    if suggestion:
+                        suggestion = suggestion.title()
+                else:
+                    print(f"Wikipedia ha rifiutato la connessione con codice: {w_resp.status_code}")
+                    
+        except Exception as e:
+            print(f"Errore di connessione a Wikipedia: {e}")
+            pass 
             
     return {"results": results[:12], "suggestion": suggestion}
 
