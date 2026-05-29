@@ -334,15 +334,48 @@ async def get_current_user(request: Request, authorization: Optional[str] = Head
     profile = _build_user_profile(decoded)
     return await _upsert_user(profile)
 
-async def tmdb_get(path: str, params: dict = None) -> dict:
+async def tmdb_get(path: str, params: dict = None, cache_hours: int = 48) -> dict:
     p = {"language": TMDB_LANG}
     if params:
         p.update(params)
+        
+    # 1. Generiamo una "chiave" unica basata su cosa l'utente ha cercato
+    # Es: "/search/movie?language=it-IT&query=Inception"
+    query_string = "&".join(f"{k}={v}" for k, v in sorted(p.items()))
+    cache_key = f"{path}?{query_string}"
+    
+    now = datetime.now(timezone.utc)
+    
+    # 2. Controlliamo se abbiamo GIA' questa risposta salvata nel database
+    try:
+        cached = await db.tmdb_cache.find_one({"_id": cache_key})
+        if cached:
+            # Controlliamo che la ricerca non sia più vecchia di 48 ore
+            delta = (now - cached["updated_at"]).total_seconds()
+            if delta < (cache_hours * 3600):
+                return cached["data"]
+    except Exception as e:
+        logger.error(f"Errore lettura cache TMDB: {e}")
+
+    # 3. Se NON c'è, o è scaduta, chiediamo i dati veri a TMDB
     async with httpx.AsyncClient(timeout=15.0) as c:
         r = await c.get(f"{TMDB_BASE}{path}", headers=TMDB_HEADERS, params=p)
         if r.status_code != 200:
             raise HTTPException(status_code=502, detail=f"TMDB error: {r.status_code}")
-        return r.json()
+        
+        data = r.json()
+        
+        # 4. Salviamo i dati freschi nel Database per i prossimi utenti!
+        try:
+            await db.tmdb_cache.update_one(
+                {"_id": cache_key},
+                {"$set": {"data": data, "updated_at": now}},
+                upsert=True
+            )
+        except Exception as e:
+            logger.error(f"Errore scrittura cache TMDB: {e}")
+            
+        return data
 
 def fmt_movie(m: dict) -> dict:
     return {
@@ -1751,6 +1784,9 @@ async def startup_db():
     
     # --- NUOVO: Indice per non inviare doppie notifiche ---
     await db.notifications_log.create_index([("person_id", 1), ("movie_id", 1)], unique=True)
+    
+    # --- NUOVO: Il "netturbino" di MongoDB che cancella i dati TMDB vecchi di 48 ore ---
+    await db.tmdb_cache.create_index([("updated_at", 1)], expireAfterSeconds=172800)
     
     # --- NUOVO: Avvia il motore delle notifiche in background ---
     asyncio.create_task(background_actor_checker())
