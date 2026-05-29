@@ -679,6 +679,62 @@ async def check_person_status(request: Request, person_id: int, user: dict = Dep
     doc = await db.user_people.find_one({"user_id": user["user_id"], "person_id": person_id})
     return {"is_following": bool(doc)}
 
+# ==========================================
+# PROFILI PUBBLICI E FILM IN EVIDENZA
+# ==========================================
+
+class HighlightedMovie(BaseModel):
+    tmdb_id: int
+    title: str
+    poster_url: Optional[str] = None
+
+class HighlightedMoviesReq(BaseModel):
+    movies: List[HighlightedMovie]
+
+@api_router.post("/user/highlighted-movies")
+@limiter.limit("20/minute")
+async def update_highlighted_movies(request: Request, req: HighlightedMoviesReq, user: dict = Depends(get_current_user)):
+    # Limitiamo a un massimo di 4 film in evidenza per non intasare la UI
+    movies_to_save = [m.model_dump() for m in req.movies[:4]]
+    
+    await db.users.update_one(
+        {"user_id": user["user_id"]},
+        {"$set": {"highlighted_movies": movies_to_save}}
+    )
+    return {"ok": True, "highlighted_movies": movies_to_save}
+
+@api_router.get("/friends/{friend_id}/profile")
+@limiter.limit("30/minute")
+async def get_friend_profile(request: Request, friend_id: str, user: dict = Depends(get_current_user)):
+    # 1. Controlla che siano effettivamente amici (privacy)
+    if not await _are_friends(user["user_id"], friend_id):
+        raise HTTPException(status_code=403, detail="Non sei amico di questo utente")
+
+    # 2. Recupera i dati base e i film in evidenza dell'amico
+    target_user = await db.users.find_one(
+        {"user_id": friend_id}, 
+        {"_id": 0, "name": 1, "picture": 1, "highlighted_movies": 1, "created_at": 1}
+    )
+    if not target_user:
+        raise HTTPException(status_code=404, detail="Utente non trovato")
+
+    # 3. Recupera gli attori seguiti dall'amico
+    followed_cursor = db.user_people.find({"user_id": friend_id}, {"_id": 0}).sort("created_at", -1)
+    followed_actors = [doc async for doc in followed_cursor]
+
+    # 4. Calcola quanti film ha visto in totale (per fargli fare un po' di scena)
+    total_watched = await db.user_movies.count_documents({"user_id": friend_id, "status": "watched"})
+
+    return {
+        "user_id": friend_id,
+        "name": target_user.get("name", "Utente"),
+        "picture": target_user.get("picture"),
+        "member_since": target_user.get("created_at").isoformat() if target_user.get("created_at") else None,
+        "total_watched": total_watched,
+        "highlighted_movies": target_user.get("highlighted_movies", []),
+        "followed_actors": followed_actors
+    }
+
 @api_router.get("/user/stats")
 @limiter.limit("30/minute")
 async def user_stats(request: Request, user: dict = Depends(get_current_user)):
@@ -1522,99 +1578,6 @@ async def get_public_reviews(request: Request, tmdb_id: int):
             "replies": r.get("replies", [])
         })
     return {"reviews": out}
-
-# ===== GESTIONE ATTORI SEGUITI E STATISTICHE =====
-class FollowPersonReq(BaseModel):
-    name: str
-    profile_url: Optional[str] = None
-
-@api_router.post("/user/people/{person_id}/follow")
-@limiter.limit("20/minute")
-async def follow_person(request: Request, person_id: int, req: FollowPersonReq, user: dict = Depends(get_current_user)):
-    doc = {
-        "user_id": user["user_id"],
-        "person_id": person_id,
-        "name": req.name,
-        "profile_url": req.profile_url,
-        "created_at": datetime.now(timezone.utc)
-    }
-    await db.user_people.update_one(
-        {"user_id": user["user_id"], "person_id": person_id},
-        {"$set": doc},
-        upsert=True
-    )
-    return {"ok": True, "status": "followed"}
-
-@api_router.delete("/user/people/{person_id}/unfollow")
-@limiter.limit("20/minute")
-async def unfollow_person(request: Request, person_id: int, user: dict = Depends(get_current_user)):
-    await db.user_people.delete_one({"user_id": user["user_id"], "person_id": person_id})
-    return {"ok": True, "status": "unfollowed"}
-
-@api_router.get("/user/people/{person_id}/status")
-@limiter.limit("30/minute")
-async def check_person_status(request: Request, person_id: int, user: dict = Depends(get_current_user)):
-    doc = await db.user_people.find_one({"user_id": user["user_id"], "person_id": person_id})
-    return {"is_following": bool(doc)}
-
-@api_router.get("/user/stats")
-@limiter.limit("30/minute")
-async def user_stats(request: Request, user: dict = Depends(get_current_user)):
-    pipeline = [
-        {"$match": {"user_id": user["user_id"]}},
-        {"$group": {
-            "_id": "$status",
-            "count": {"$sum": 1},
-            "avg_rating": {"$avg": "$overall"},
-        }},
-    ]
-    dist_pipeline = [
-        {"$match": {"user_id": user["user_id"], "status": "watched", "overall": {"$exists": True, "$ne": None}}},
-        {"$group": {"_id": "$overall", "count": {"$sum": 1}}},
-    ]
-    by_status = {}
-    total = 0
-    sum_minutes = 0
-    async for row in db.user_movies.aggregate(pipeline):
-        by_status[row["_id"] or "unknown"] = {
-            "count": row["count"],
-            "avg_rating": round(row["avg_rating"], 2) if row["avg_rating"] else None,
-        }
-        total += row["count"]
-        
-    rating_dist = {}
-    async for row in db.user_movies.aggregate(dist_pipeline):
-        val = row.get("_id")
-        if val is not None:
-            try:
-                bucket = str(int(float(val)))
-                rating_dist[bucket] = rating_dist.get(bucket, 0) + row.get("count", 0)
-            except (ValueError, TypeError):
-                pass
-
-    runtime_cursor = db.user_movies.find(
-        {"user_id": user["user_id"], "status": "watched"},
-        {"_id": 0, "movie.runtime": 1},
-    )
-    async for d in runtime_cursor:
-        rt = ((d.get("movie") or {}).get("runtime")) or 0
-        sum_minutes += rt
-        
-    # RECUPERA GLI ATTORI SEGUITI E LI METTE NELLE STATISTICHE
-    followed_cursor = db.user_people.find({"user_id": user["user_id"]}, {"_id": 0}).sort("created_at", -1)
-    followed_actors = [doc async for doc in followed_cursor]
-        
-    return {
-        "total_watched": by_status.get("watched", {}).get("count", 0),
-        "total_watchlist": by_status.get("watchlist", {}).get("count", 0),
-        "average_rating": by_status.get("watched", {}).get("avg_rating"),
-        "total": total,
-        "by_status": by_status,
-        "rating_distribution": rating_dist,
-        "watched_minutes": sum_minutes,
-        "watched_hours": round(sum_minutes / 60, 1),
-        "followed_actors": followed_actors,
-    }
 
 # ==========================================
 # ROTTA PER IL QUIZ
