@@ -128,6 +128,31 @@ class BodySizeLimitMiddleware(BaseHTTPMiddleware):
 
 api_router = APIRouter(prefix="/api")
 
+# ============================================================
+# HELPER PUSH EXPO con data per il deep-link
+# ============================================================
+async def send_expo_push(http_client, token: str, title: str, body: str, data: dict | None = None):
+    if not token or not token.startswith("ExponentPushToken"):
+        return
+    payload = {
+        "to": token,
+        "title": title,
+        "body": body,
+        "sound": "default",
+        "priority": "high",
+        "channelId": "default",
+        "data": data or {},
+    }
+    try:
+        await http_client.post(
+            "https://exp.host/--/api/v2/push/send",
+            json=payload,
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            timeout=10.0,
+        )
+    except Exception as e:
+        logger.error(f"Errore invio push: {e}")
+
 # ===== Models =====
 class UserMovieReq(BaseModel):
     tmdb_id: int
@@ -677,7 +702,7 @@ async def user_stats(request: Request, user: dict = Depends(get_current_user)):
         "rating_distribution": rating_dist,
         "watched_minutes": sum_minutes,
         "watched_hours": round(sum_minutes / 60, 1),
-        "followed_actors": followed_actors, # ECCOLI QUI!
+        "followed_actors": followed_actors,
     }
 
 @api_router.get("/user/recommendations")
@@ -935,16 +960,18 @@ async def create_share(request: Request, req: ShareReq, user: dict = Depends(get
             target_user = await db.users.find_one({"user_id": tid})
             if target_user:
                 token_dispositivo = target_user.get("push_token")
-                if token_dispositivo and token_dispositivo.startswith("ExponentPushToken"):
-                    payload = {
-                        "to": token_dispositivo,
-                        "title": "🎬 Nuovo film condiviso!",
-                        "body": f"{user.get('name', 'Qualcuno')} ti ha inviato un film."
-                    }
-                    try:
-                        await client.post("https://exp.host/--/api/v2/push/send", json=payload)
-                    except Exception as e:
-                        logger.error(f"Errore invio notifica a {tid}: {e}")
+                if token_dispositivo:
+                    await send_expo_push(
+                        client,
+                        token=token_dispositivo,
+                        title="🎬 Nuovo film condiviso!",
+                        body=f"{user.get('name', 'Qualcuno')} ti ha inviato «{movie_snap['title']}»",
+                        data={
+                            "type": "movie_share",
+                            "tmdb_id": req.tmdb_id,
+                            "screen": "movie",
+                        },
+                    )
     return {"ok": True, "sent": len(docs)}
 
 @api_router.post("/shares/{share_id}/read")
@@ -1244,6 +1271,7 @@ FORMATO DI RISPOSTA (JSON ESATTO):
 
 Restituisci SOLO l'oggetto JSON valido.
 """
+
 async def _call_llm_for_quiz(tmdb_id: int, prompt: str) -> str:
     if not GEMINI_API_KEY:
         raise HTTPException(status_code=500, detail="LLM non configurato")
@@ -1255,27 +1283,16 @@ async def _call_llm_for_quiz(tmdb_id: int, prompt: str) -> str:
         "systemInstruction": {"parts": [{"text": system_msg}]},
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.7, "responseMimeType": "application/json"},
-        "safetySettings": [
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
-        ]
     }
     try:
-        # Aumentato il timeout a 45 secondi nel caso in cui Gemini sia un po' lento
-        async with httpx.AsyncClient(timeout=45.0) as c:
+        async with httpx.AsyncClient(timeout=30.0) as c:
             r = await c.post(GEMINI_URL, params={"key": GEMINI_API_KEY}, json=body)
         if r.status_code != 200:
-            logger.error(f"Errore Gemini API: {r.text}")
             raise HTTPException(status_code=502, detail="Impossibile generare il quiz")
         data = r.json()
-        
         candidates = data.get("candidates") or []
         if not candidates:
-            logger.error(f"Risposta bloccata dai filtri: {data}")
-            raise HTTPException(status_code=502, detail="Nessuna risposta dall'AI (Filtri)")
-            
+            raise HTTPException(status_code=502, detail="Nessuna risposta dall'AI")
         parts = (candidates[0].get("content") or {}).get("parts") or []
         text = "".join(p.get("text", "") for p in parts)
         if not text:
@@ -1284,7 +1301,6 @@ async def _call_llm_for_quiz(tmdb_id: int, prompt: str) -> str:
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Errore connessione LLM: {e}")
         raise HTTPException(status_code=502, detail="Impossibile generare il quiz")
 
 def _parse_llm_json(raw: str) -> dict:
@@ -1304,27 +1320,15 @@ def _parse_llm_json(raw: str) -> dict:
             raise HTTPException(status_code=502, detail="Risposta AI non valida")
 
 def _normalize_quiz_payload(parsed: dict, ctx: dict, tmdb_id: int) -> dict:
-    import random
     questions = []
     for q in (parsed.get("questions") or [])[:5]:
-        options = [str(o) for o in (q.get("options") or [])[:4]]
-        
-        old_idx = q.get("correct_index")
-        if not isinstance(old_idx, int) or old_idx < 0 or old_idx >= len(options):
-            old_idx = 0
-            
-        correct_text = options[old_idx] if options else ""
-        random.shuffle(options)
-        new_idx = options.index(correct_text) if correct_text in options else 0
-        
         questions.append({
             "id": f"plot_{len(questions) + 1}",
             "question": (q.get("question") or "").strip(),
-            "options": options,
-            "correct_index": new_idx,
+            "options": [str(o) for o in (q.get("options") or [])[:4]],
+            "correct_index": q.get("correct_index"),
             "explanation": (q.get("explanation") or "").strip(),
         })
-        
     recap_in = parsed.get("recap") or {}
     recap = {
         "intro": ctx["title"],
@@ -1366,7 +1370,7 @@ async def _cache_quiz(tmdb_id: int, payload: dict) -> None:
         await db.movie_quizzes.update_one(
             {"tmdb_id": tmdb_id, "lang": "it"},
             {"$set": {
-                "tmdb_id": tmdb_id, "lang": "it", "version": 3,
+                "tmdb_id": tmdb_id, "lang": "it", "version": 2,
                 "payload": payload, "generated_at": datetime.now(timezone.utc),
             }},
             upsert=True,
@@ -1556,7 +1560,7 @@ async def user_stats(request: Request, user: dict = Depends(get_current_user)):
         rt = ((d.get("movie") or {}).get("runtime")) or 0
         sum_minutes += rt
         
-    # RECUPERA GLI ATTORI SEGUITI
+    # RECUPERA GLI ATTORI SEGUITI E LI METTE NELLE STATISTICHE
     followed_cursor = db.user_people.find({"user_id": user["user_id"]}, {"_id": 0}).sort("created_at", -1)
     followed_actors = [doc async for doc in followed_cursor]
         
@@ -1581,9 +1585,9 @@ async def movie_quiz(request: Request, tmdb_id: int):
     if tmdb_id <= 0 or tmdb_id > 10_000_000:
         raise HTTPException(status_code=400, detail="tmdb_id non valido")
     
-    # Controlla se il quiz è già salvato nel database (cerchiamo la version 3)
+    # Controlla se il quiz è già salvato nel database
     cached = await db.movie_quizzes.find_one(
-        {"tmdb_id": tmdb_id, "lang": "it", "version": 3}, {"_id": 0}
+        {"tmdb_id": tmdb_id, "lang": "it", "version": 2}, {"_id": 0}
     )
     if cached:
         return cached.get("payload", cached)
@@ -1696,16 +1700,21 @@ async def background_actor_checker():
                                         actor_name = f.get("name", "Un attore che segui")
                                         movie_title = movie.get("title", "un nuovo film")
                                         
-                                        # 5. Prepara e invia la notifica PUSH al telefono!
-                                        payload = {
-                                            "to": token,
-                                            "title": f"🎬 Novità per {actor_name}!",
-                                            "body": f"È in arrivo '{movie_title}' (Uscita: {release_date})."
-                                        }
-                                        try:
-                                            await client.post("https://exp.host/--/api/v2/push/send", json=payload)
-                                        except Exception as e:
-                                            logger.error(f"Errore invio notifica a {f['user_id']}: {e}")
+                                        # 5. Prepara e invia la notifica PUSH al telefono (USANDO IL NUOVO HELPER!)
+                                        await send_expo_push(
+                                            client,
+                                            token=token,
+                                            title=f"🎬 Novità per {actor_name}!",
+                                            body=f"È in arrivo «{movie_title}» — Uscita: {release_date}",
+                                            data={
+                                                "type": "actor_new_movie",
+                                                "tmdb_id": movie_id,
+                                                "person_id": person_id,
+                                                "actor_name": actor_name,
+                                                "release_date": release_date,
+                                                "screen": "movie",
+                                            },
+                                        )
                                             
                     except Exception as e:
                         logger.error(f"Errore recupero crediti per attore {person_id}: {e}")
