@@ -755,7 +755,7 @@ async def update_avatar(request: Request, req: AvatarReq, user: dict = Depends(g
 @api_router.get("/search-avatar")
 @limiter.limit("20/minute")
 async def search_avatar(request: Request, q: str, user: dict = Depends(get_current_user)):
-    # 1. Cerchiamo normalmente su TMDB
+    # 1. Cerchiamo su TMDB come sempre
     try:
         data = await tmdb_get("/search/multi", {"query": q, "page": "1"})
     except Exception as e:
@@ -775,21 +775,28 @@ async def search_avatar(request: Request, q: str, user: dict = Depends(get_curre
                 
     suggestion = None
     
-    # 2. IL TRUCCO WIKIPEDIA: Se TMDB non ha trovato nulla, chiediamo a Wikipedia un suggerimento
+    # 2. IL TRUCCO WIKIPEDIA (Potenziato!)
     if not results:
         import httpx
+        import urllib.parse
         try:
-            # L'API di Wikipedia con 'srinfo=suggestion' ci dà l'autocorrettore gratis e senza API key
-            wiki_url = f"https://it.wikipedia.org/w/api.php?action=query&list=search&srsearch={q}&srinfo=suggestion&format=json"
+            # Codifichiamo la parola per internet (gestisce spazi e caratteri strani)
+            safe_q = urllib.parse.quote(q)
+            
+            # ATTENZIONE: Usiamo en.wikipedia.org (Inglese) che ha un autocorrettore potentissimo!
+            wiki_url = f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={safe_q}&srinfo=suggestion&format=json"
+            
             async with httpx.AsyncClient(timeout=2.0) as client:
                 w_resp = await client.get(wiki_url)
                 w_data = w_resp.json()
-                # Se Wikipedia ci suggerisce un nome corretto, lo peschiamo!
                 suggestion = w_data.get("query", {}).get("searchinfo", {}).get("suggestion")
+                
+                # Piccola finezza: se il suggerimento lo trova, facciamo la prima lettera maiuscola per estetica
+                if suggestion:
+                    suggestion = suggestion.title()
         except Exception:
-            pass # Se Wikipedia non risponde, fa niente, non facciamo crashare l'app
+            pass # Ignoriamo in silenzio se Wikipedia è offline
             
-    # Restituiamo sia i risultati (che sono vuoti) sia l'eventuale suggerimento
     return {"results": results[:12], "suggestion": suggestion}
 
 @api_router.get("/user/stats")
