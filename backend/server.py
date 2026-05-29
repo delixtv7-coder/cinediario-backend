@@ -1055,11 +1055,9 @@ Non aggiungere testo prima o dopo il JSON, non usare markdown."""
                 m = results[0]
                 out.append({**fmt_movie(m), "why": (s.get("why") or "").strip()})
             else:
-                out.append({
-                    "tmdb_id": None, "title": title, "poster_url": None, "backdrop_url": None,
-                    "release_date": f"{year}-01-01" if year else None, "overview": None, "vote_average": 0,
-                    "why": (s.get("why") or "").strip(),
-                })
+                # Se il film non si trova su TMDB, lo ignoriamo completamente
+                # e passiamo a quello successivo, senza creare film "fantasma".
+                continue
         except Exception:
             continue
     return {"movies": out}
