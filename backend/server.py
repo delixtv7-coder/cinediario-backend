@@ -792,6 +792,7 @@ async def user_stats(request: Request, user: dict = Depends(get_current_user)):
         "watched_minutes": sum_minutes,
         "watched_hours": round(sum_minutes / 60, 1),
         "followed_actors": followed_actors,
+        "highlighted_movies": user.get("highlighted_movies", []),
     }
 
 @api_router.get("/user/recommendations")
