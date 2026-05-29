@@ -1020,23 +1020,33 @@ Non aggiungere testo prima o dopo il JSON, non usare markdown."""
         "systemInstruction": {"parts": [{"text": "Sei un esperto cinefilo italiano. Consigli film esistenti reali, mai inventati. Rispondi solo JSON."}]},
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.8, "responseMimeType": "application/json"},
+        "safetySettings": [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
+        ]
     }
     
     try:
-        async with httpx.AsyncClient(timeout=30.0) as c:
+        # Alzato il timeout a 45 secondi
+        async with httpx.AsyncClient(timeout=45.0) as c:
             r = await c.post(GEMINI_URL, params={"key": GEMINI_API_KEY}, json=body)
         if r.status_code != 200:
-            raise HTTPException(status_code=502, detail="Impossibile generare consigli")
+            logger.error(f"Errore API AI: {r.text}")
+            raise HTTPException(status_code=502, detail="Impossibile generare consigli (Errore AI)")
         data = r.json()
         candidates = data.get("candidates") or []
         if not candidates:
-            raise HTTPException(status_code=502, detail="Nessuna risposta dall'AI")
+            logger.error(f"Risposta AI bloccata: {data}")
+            raise HTTPException(status_code=502, detail="Nessuna risposta dall'AI (Filtri di sicurezza)")
         text = "".join(p.get("text", "") for p in candidates[0].get("content", {}).get("parts", []))
         parsed = _parse_llm_json(text)
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=502, detail="Errore durante la generazione dei consigli")
+        logger.error(f"Errore connessione AI: {e}")
+        raise HTTPException(status_code=502, detail="Errore durante la generazione (Riprova)")
 
     suggestions = (parsed.get("movies") or [])[:7]
     out = []
@@ -1055,8 +1065,7 @@ Non aggiungere testo prima o dopo il JSON, non usare markdown."""
                 m = results[0]
                 out.append({**fmt_movie(m), "why": (s.get("why") or "").strip()})
             else:
-                # Se il film non si trova su TMDB, lo ignoriamo completamente
-                # e passiamo a quello successivo, senza creare film "fantasma".
+                # Se il film non esiste, lo salta direttamente senza creare "fantasmi"
                 continue
         except Exception:
             continue
