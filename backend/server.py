@@ -1654,14 +1654,14 @@ class ReplyReq(BaseModel):
 async def add_public_review(request: Request, tmdb_id: int, req: PublicReviewReq, user: dict = Depends(get_current_user)):
     if user.get("auth_provider") == "guest":
         raise HTTPException(status_code=403, detail="Crea un account per lasciare recensioni pubbliche")
-    
+
     text_stripped = req.text.strip() if req.text else ""
     if not text_stripped and req.rating is None:
         raise HTTPException(status_code=400, detail="Inserisci un voto o un commento")
-        
+
     now = datetime.now(timezone.utc)
-    
-    # Salviamo/aggiorniamo i dati SENZA cancellare la lista dei "likes" se la recensione esiste già
+
+    # Prepara i dati da aggiornare
     updates = {
         "user_name": user.get("name", "Utente"),
         "user_picture": user.get("picture"),
@@ -1670,29 +1670,30 @@ async def add_public_review(request: Request, tmdb_id: int, req: PublicReviewReq
         "is_anonymous": req.is_anonymous,
         "updated_at": now
     }
-    
-    await db.public_reviews.update_one(
+
+    # Salviamo la recensione. $setOnInsert protegge i "likes" se la recensione esiste già!
+    result = await db.public_reviews.update_one(
         {"tmdb_id": tmdb_id, "user_id": user["user_id"]},
         {
             "$set": updates,
             "$setOnInsert": {
                 "review_id": uuid.uuid4().hex,
                 "created_at": now,
-                "likes": [] # Array vuoto pronto ad accogliere i Mi Piace!
+                "likes": [] 
             }
         },
         upsert=True
     )
-    
-    # --- AGGIUNTA FEED: Diciamo a tutti che hai scritto una recensione! (Solo se pubblica e testuale) ---
-    if not req.is_anonymous and text_stripped:
+
+    # --- AGGIUNTA FEED: Logga il voto o commento SOLO se è nuovo (non una modifica) e non anonimo ---
+    if not req.is_anonymous and result.matched_count == 0:
         try:
             snap = await _movie_snapshot(tmdb_id)
             m_title = snap.get("title", "un film")
             await log_activity(user["user_id"], "review", str(tmdb_id), str(m_title))
         except Exception as e:
             print(f"Errore feed review: {e}")
-            
+
     return {"ok": True}
 
 @api_router.post("/movies/{tmdb_id}/public-reviews/{review_id}/reply")
