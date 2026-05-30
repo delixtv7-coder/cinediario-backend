@@ -613,6 +613,9 @@ async def upsert_user_movie(request: Request, req: UserMovieReq, user: dict = De
         upsert=True,
     )
     doc = await db.user_movies.find_one({"user_id": user["user_id"], "tmdb_id": req.tmdb_id}, {"_id": 0})
+    if req.movies:
+        for m in req.movies:
+            await log_activity(user["user_id"], "showcase", m.tmdb_id, m.title)
     return _serialize_user_movie(doc)
 
 @api_router.patch("/user/movies/{tmdb_id}")
@@ -665,6 +668,7 @@ async def follow_person(request: Request, person_id: int, req: FollowPersonReq, 
         {"$set": doc},
         upsert=True
     )
+    await log_activity(user["user_id"], "follow", person_id, req.name)
     return {"ok": True, "status": "followed"}
 
 @api_router.delete("/user/people/{person_id}/unfollow")
@@ -809,6 +813,49 @@ async def search_avatar(request: Request, q: str, user: dict = Depends(get_curre
             pass 
             
     return {"results": results[:12], "suggestion": suggestion}
+
+# ==========================================
+# FEED SOCIALE - Attività
+# ==========================================
+
+async def log_activity(user_id: str, action_type: str, target_id: str, target_name: str, meta: dict = {}):
+    try:
+        user_doc = await db.users.find_one({"user_id": user_id}, {"name": 1})
+        user_name = user_doc.get("name") if user_doc else "Utente"
+        activity = {
+            "user_id": user_id,
+            "user_name": user_name,
+            "action_type": action_type, # "watch", "showcase", "follow"
+            "target_id": str(target_id),
+            "target_name": target_name,
+            "meta": meta,
+            "created_at": datetime.utcnow()
+        }
+        await db.activity_log.insert_one(activity)
+    except Exception as e:
+        print(f"Errore durante il salvataggio del log: {e}")
+
+@api_router.get("/feed")
+@limiter.limit("30/minute")
+async def get_feed(request: Request, user: dict = Depends(get_current_user)):
+    # 1. Trova chi segui (i tuoi amici)
+    friends_cursor = db.friends.find({"user_id": user["user_id"]}, {"friend_id": 1})
+    friends = [f["friend_id"] async for f in friends_cursor]
+    
+    # 2. Aggiungi anche le tue stesse azioni per vederle nel feed
+    friends.append(user["user_id"])
+    
+    # 3. Prendi le ultime 30 attività della tua cerchia
+    activities = await db.activity_log.find({"user_id": {"$in": friends}}) \
+        .sort("created_at", -1) \
+        .limit(30) \
+        .to_list(length=30)
+        
+    # Converte l'ObjectId in stringa per non far bloccare l'app
+    for act in activities:
+        act["_id"] = str(act["_id"])
+        
+    return {"activities": activities}
 
 @api_router.get("/user/stats")
 @limiter.limit("30/minute")
