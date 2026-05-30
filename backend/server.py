@@ -612,11 +612,7 @@ async def upsert_user_movie(request: Request, req: UserMovieReq, user: dict = De
         {"$set": update, "$setOnInsert": {"created_at": now}},
         upsert=True,
     )
-    doc = await db.user_movies.find_one({"user_id": user["user_id"], "tmdb_id": req.tmdb_id}, {"_id": 0})
-    if req.movies:
-        for m in req.movies:
-            await log_activity(user["user_id"], "showcase", m.tmdb_id, m.title)
-    return _serialize_user_movie(doc)
+    
 
 @api_router.patch("/user/movies/{tmdb_id}")
 @limiter.limit("30/minute")
@@ -635,6 +631,15 @@ async def update_user_movie(request: Request, tmdb_id: int, req: UpdateMovieReq,
         
     await db.user_movies.update_one({"user_id": user["user_id"], "tmdb_id": tmdb_id}, {"$set": updates})
     doc = await db.user_movies.find_one({"user_id": user["user_id"], "tmdb_id": tmdb_id}, {"_id": 0})
+    
+    # --- AGGIUNTA FEED PROTETTA: Voto / Aggiornamento ---
+    try:
+        if updates.get("status") == "watched" or existing.get("status") == "watched":
+            m_title = doc.get("movie", {}).get("title", "un film")
+            await log_activity(user["user_id"], "watch", str(tmdb_id), m_title)
+    except Exception:
+        pass
+
     return _serialize_user_movie(doc)
 
 @api_router.delete("/user/movies/{tmdb_id}")
@@ -668,7 +673,14 @@ async def follow_person(request: Request, person_id: int, req: FollowPersonReq, 
         {"$set": doc},
         upsert=True
     )
-    await log_activity(user["user_id"], "follow", person_id, req.name)
+    
+    # --- AGGIUNTA FEED PROTETTA: Segui un attore ---
+    try:
+        p_name = getattr(req, "name", "un attore")
+        await log_activity(user["user_id"], "follow", str(person_id), str(p_name))
+    except Exception:
+        pass
+        
     return {"ok": True, "status": "followed"}
 
 @api_router.delete("/user/people/{person_id}/unfollow")
@@ -705,6 +717,17 @@ async def update_highlighted_movies(request: Request, req: HighlightedMoviesReq,
         {"user_id": user["user_id"]},
         {"$set": {"highlighted_movies": movies_to_save}}
     )
+    
+    # --- AGGIUNTA FEED PROTETTA: Film in vetrina ---
+    try:
+        if hasattr(req, "movies") and req.movies:
+            for m in req.movies:
+                m_id = getattr(m, "tmdb_id", "0")
+                m_title = getattr(m, "title", "un film")
+                await log_activity(user["user_id"], "showcase", str(m_id), str(m_title))
+    except Exception:
+        pass
+        
     return {"ok": True, "highlighted_movies": movies_to_save}
 
 @api_router.get("/friends/{friend_id}/profile")
