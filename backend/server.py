@@ -1660,23 +1660,39 @@ async def add_public_review(request: Request, tmdb_id: int, req: PublicReviewReq
         raise HTTPException(status_code=400, detail="Inserisci un voto o un commento")
         
     now = datetime.now(timezone.utc)
-    review_doc = {
-        "review_id": uuid.uuid4().hex,
-        "tmdb_id": tmdb_id,
-        "user_id": user["user_id"],
+    
+    # Salviamo/aggiorniamo i dati SENZA cancellare la lista dei "likes" se la recensione esiste già
+    updates = {
         "user_name": user.get("name", "Utente"),
         "user_picture": user.get("picture"),
         "text": text_stripped[:1000] if text_stripped else None,
         "rating": req.rating,
         "is_anonymous": req.is_anonymous,
-        "created_at": now
+        "updated_at": now
     }
     
     await db.public_reviews.update_one(
         {"tmdb_id": tmdb_id, "user_id": user["user_id"]},
-        {"$set": review_doc},
+        {
+            "$set": updates,
+            "$setOnInsert": {
+                "review_id": uuid.uuid4().hex,
+                "created_at": now,
+                "likes": [] # Array vuoto pronto ad accogliere i Mi Piace!
+            }
+        },
         upsert=True
     )
+    
+    # --- AGGIUNTA FEED: Diciamo a tutti che hai scritto una recensione! (Solo se pubblica e testuale) ---
+    if not req.is_anonymous and text_stripped:
+        try:
+            snap = await _movie_snapshot(tmdb_id)
+            m_title = snap.get("title", "un film")
+            await log_activity(user["user_id"], "review", str(tmdb_id), str(m_title))
+        except Exception as e:
+            print(f"Errore feed review: {e}")
+            
     return {"ok": True}
 
 @api_router.post("/movies/{tmdb_id}/public-reviews/{review_id}/reply")
@@ -1733,6 +1749,7 @@ async def get_public_reviews(request: Request, tmdb_id: int):
     out = []
     async for r in cursor:
         is_anon = r.get("is_anonymous", False)
+        likes = r.get("likes", []) # Peschiamo i likes dal database
         out.append({
             "review_id": r["review_id"],
             "user_id": r.get("user_id"),
@@ -1742,9 +1759,38 @@ async def get_public_reviews(request: Request, tmdb_id: int):
             "user_name": "Utente Anonimo" if is_anon else r.get("user_name", "Utente"),
             "user_picture": None if is_anon else r.get("user_picture"),
             "is_anonymous": is_anon,
-            "replies": r.get("replies", [])
+            "replies": r.get("replies", []),
+            "likes": likes,
+            "likes_count": len(likes)
         })
     return {"reviews": out}
+
+@api_router.post("/movies/{tmdb_id}/public-reviews/{review_id}/like")
+@limiter.limit("30/minute")
+async def toggle_review_like(request: Request, tmdb_id: int, review_id: str, user: dict = Depends(get_current_user)):
+    if user.get("auth_provider") == "guest":
+        raise HTTPException(status_code=403, detail="Crea un account per mettere like")
+    
+    uid = user["user_id"]
+    review = await db.public_reviews.find_one({"review_id": review_id})
+    if not review:
+        raise HTTPException(status_code=404, detail="Recensione non trovata")
+    
+    likes = review.get("likes", [])
+    
+    # Se ha già messo like, lo togliamo. Se non l'ha messo, lo aggiungiamo.
+    if uid in likes:
+        likes.remove(uid)
+        status = "unliked"
+    else:
+        likes.append(uid)
+        status = "liked"
+        
+    await db.public_reviews.update_one(
+        {"review_id": review_id},
+        {"$set": {"likes": likes}}
+    )
+    return {"ok": True, "status": status, "likes_count": len(likes)}
 
 # ==========================================
 # ROTTA PER IL QUIZ
