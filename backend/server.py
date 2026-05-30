@@ -613,6 +613,16 @@ async def upsert_user_movie(request: Request, req: UserMovieReq, user: dict = De
         upsert=True,
     )
     
+    # --- AGGIUNTA FEED PROTETTA: Registra il film visto ---
+    try:
+        if req.status == "watched":
+            m_title = snapshot.get("title") if snapshot else "un film"
+            await log_activity(user["user_id"], "watch", str(req.tmdb_id), str(m_title))
+    except Exception as e:
+        print(f"Errore feed upsert: {e}")
+
+    doc = await db.user_movies.find_one({"user_id": user["user_id"], "tmdb_id": req.tmdb_id}, {"_id": 0})
+    return _serialize_user_movie(doc)
 
 @api_router.patch("/user/movies/{tmdb_id}")
 @limiter.limit("30/minute")
@@ -632,13 +642,15 @@ async def update_user_movie(request: Request, tmdb_id: int, req: UpdateMovieReq,
     await db.user_movies.update_one({"user_id": user["user_id"], "tmdb_id": tmdb_id}, {"$set": updates})
     doc = await db.user_movies.find_one({"user_id": user["user_id"], "tmdb_id": tmdb_id}, {"_id": 0})
     
-    # --- AGGIUNTA FEED PROTETTA: Voto / Aggiornamento ---
+  # --- AGGIUNTA FEED PROTETTA: Voto / Aggiornamento ---
     try:
         if updates.get("status") == "watched" or existing.get("status") == "watched":
-            m_title = doc.get("movie", {}).get("title", "un film")
-            await log_activity(user["user_id"], "watch", str(tmdb_id), m_title)
-    except Exception:
-        pass
+            # Estraiamo il titolo in modo ipersicuro, evitando crash se i dati mancano
+            m_dict = doc.get("movie") or {}
+            m_title = m_dict.get("title") or "un film"
+            await log_activity(user["user_id"], "watch", str(tmdb_id), str(m_title))
+    except Exception as e:
+        print(f"Errore feed update: {e}")
 
     return _serialize_user_movie(doc)
 
@@ -869,25 +881,24 @@ async def get_feed(request: Request, user: dict = Depends(get_current_user)):
         {"_id": 0, "user_lo": 1, "user_hi": 1}
     )
     
-    friends = []
+    friends = [me] # Ti aggiungi direttamente alla lista!
     async for fr in cursor:
         # Peschiamo l'ID dell'amico (che si può trovare in user_lo o user_hi)
         other_id = fr["user_hi"] if fr["user_lo"] == me else fr["user_lo"]
         friends.append(other_id)
     
-    # 2. Aggiungi anche te stesso per vedere le tue stesse azioni nel feed
-    friends.append(me)
-    
-    # 3. Prendi le ultime 30 attività di tutta la tua cerchia
+    # 2. Prendi le ultime 30 attività di tutta la tua cerchia
     activities = await db.activity_log.find({"user_id": {"$in": friends}}) \
         .sort("created_at", -1) \
         .limit(30) \
         .to_list(length=30)
         
-    # Converte l'ObjectId di MongoDB in una stringa normale
+    # 3. Converte l'ObjectId e Sistema le Date (il blocco che ti faceva fallire l'App!)
     for act in activities:
         act["_id"] = str(act["_id"])
-        
+        if "created_at" in act and hasattr(act["created_at"], "isoformat"):
+            act["created_at"] = act["created_at"].isoformat()
+            
     return {"activities": activities}
 
 @api_router.get("/user/stats")
