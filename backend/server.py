@@ -860,11 +860,11 @@ async def log_activity(user_id: str, action_type: str, target_id: str, target_na
         activity = {
             "user_id": user_id,
             "user_name": user_name,
-            "action_type": action_type, # "watch", "showcase", "follow"
+            "action_type": action_type, 
             "target_id": str(target_id),
             "target_name": target_name,
             "meta": meta,
-            "created_at": datetime.utcnow()
+            "created_at": datetime.now(timezone.utc) # ORA È CONSAPEVOLE DEL FUSO ORARIO
         }
         await db.activity_log.insert_one(activity)
     except Exception as e:
@@ -875,29 +875,29 @@ async def log_activity(user_id: str, action_type: str, target_id: str, target_na
 async def get_feed(request: Request, user: dict = Depends(get_current_user)):
     me = user["user_id"]
     
-    # 1. Trova i tuoi veri amici dalla collezione corretta 'friendships'
     cursor = db.friendships.find(
         {"$or": [{"user_lo": me}, {"user_hi": me}], "status": "accepted"},
         {"_id": 0, "user_lo": 1, "user_hi": 1}
     )
     
-    friends = [me] # Ti aggiungi direttamente alla lista!
+    friends = [me] 
     async for fr in cursor:
-        # Peschiamo l'ID dell'amico (che si può trovare in user_lo o user_hi)
         other_id = fr["user_hi"] if fr["user_lo"] == me else fr["user_lo"]
         friends.append(other_id)
     
-    # 2. Prendi le ultime 30 attività di tutta la tua cerchia
     activities = await db.activity_log.find({"user_id": {"$in": friends}}) \
         .sort("created_at", -1) \
         .limit(30) \
         .to_list(length=30)
         
-    # 3. Converte l'ObjectId e Sistema le Date (il blocco che ti faceva fallire l'App!)
     for act in activities:
         act["_id"] = str(act["_id"])
         if "created_at" in act and hasattr(act["created_at"], "isoformat"):
-            act["created_at"] = act["created_at"].isoformat()
+            dt_str = act["created_at"].isoformat()
+            # Se la data non finisce con Z o non ha il fuso, la forziamo in UTC
+            if not dt_str.endswith('Z') and '+' not in dt_str:
+                dt_str += 'Z'
+            act["created_at"] = dt_str
             
     return {"activities": activities}
 
