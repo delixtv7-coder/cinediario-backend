@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 import httpx
 import secrets
 import json
+import xml.etree.ElementTree as ET
 from urllib.parse import quote_plus
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
@@ -1868,6 +1869,127 @@ async def unhandled_exception(request: Request, exc: Exception):
     return JSONResponse(status_code=500, content={"detail": f"{type(exc).__name__}: {exc}"})
 
 # ==========================================
+# SEZIONE NEWS (EDICOLA)
+# ==========================================
+
+async def background_news_syncer():
+    """Motore che gira in background e aggiorna le news ogni 2 ore"""
+    while True:
+        try:
+            await asyncio.sleep(10) # Partenza ritardata all'avvio
+            logger.info("Ricerca nuove notizie di cinema...")
+            now = datetime.now(timezone.utc)
+            
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                # 1. PESCA I FILM IN USCITA (TMDB)
+                try:
+                    up = await tmdb_get("/movie/upcoming", {"region": "IT", "page": 1})
+                    for m in up.get("results", [])[:10]:
+                        if not m.get("release_date"): continue
+                        nid = f"tmdb_{m['id']}"
+                        doc = {
+                            "news_id": nid,
+                            "type": "upcoming",
+                            "title": f"🎬 Prossimamente: {m['title']}",
+                            "summary": m.get("overview") or "Scopri i dettagli di questa nuova uscita al cinema.",
+                            "image_url": f"{TMDB_IMG}{m['backdrop_path']}" if m.get("backdrop_path") else None,
+                            "source": "TMDB",
+                            "url": None, # Se è None, l'app aprirà la pagina del film internamente
+                            "target_id": str(m['id']),
+                            "published_at": m.get("release_date")
+                        }
+                        # Salviamo nel DB solo se è nuovo. Creiamo i cestini vuoti per le reazioni.
+                        await db.news_feed.update_one(
+                            {"news_id": nid}, 
+                            {"$setOnInsert": {**doc, "reactions": {"heart": [], "fire": [], "thumb": []}, "created_at": now}}, 
+                            upsert=True
+                        )
+                except Exception as e:
+                    logger.error(f"Errore sincronizzazione TMDB Upcoming: {e}")
+
+                # 2. PESCA LE NOTIZIE VERE E PROPRIE (RSS ANSA CINEMA)
+                try:
+                    rss_url = "https://www.ansa.it/sito/notizie/cultura/cinema/cinema_rss.xml"
+                    resp = await client.get(rss_url)
+                    if resp.status_code == 200:
+                        root = ET.fromstring(resp.text)
+                        for item in root.findall(".//item")[:10]:
+                            link = item.findtext("link")
+                            if not link: continue
+                            
+                            # Creiamo un ID univoco basato sul link dell'articolo
+                            nid = f"rss_{uuid.uuid5(uuid.NAMESPACE_URL, link).hex}"
+                            desc = item.findtext("description")
+                            if desc: 
+                                desc = desc.replace("<br/>", "\n").replace("<br>", "\n")
+                            
+                            doc = {
+                                "news_id": nid,
+                                "type": "article",
+                                "title": item.findtext("title"),
+                                "summary": desc[:200] + "..." if desc and len(desc) > 200 else desc,
+                                "image_url": None, 
+                                "source": "ANSA Cinema",
+                                "url": link, # L'app capirà di dover aprire il browser a questo link
+                                "target_id": None,
+                                "published_at": now.isoformat()
+                            }
+                            await db.news_feed.update_one(
+                                {"news_id": nid}, 
+                                {"$setOnInsert": {**doc, "reactions": {"heart": [], "fire": [], "thumb": []}, "created_at": now}}, 
+                                upsert=True
+                            )
+                except Exception as e:
+                    logger.error(f"Errore sincronizzazione RSS: {e}")
+
+        except Exception as e:
+            logger.error(f"Errore generale loop news: {e}")
+        
+        # Attende 2 ore prima di cercare nuove notizie
+        await asyncio.sleep(7200)
+
+@api_router.get("/news")
+@limiter.limit("30/minute")
+async def get_news_feed(request: Request, user: dict = Depends(get_current_user)):
+    # Restituisce le ultime 30 notizie salvate, dalla più recente alla più vecchia
+    cursor = db.news_feed.find({}, {"_id": 0}).sort("created_at", -1).limit(30)
+    items = await cursor.to_list(length=30)
+    return {"items": items}
+
+class ReactNewsReq(BaseModel):
+    reaction: str # Deve essere "heart", "fire" o "thumb"
+
+@api_router.post("/news/{news_id}/react")
+@limiter.limit("30/minute")
+async def toggle_news_reaction(request: Request, news_id: str, req: ReactNewsReq, user: dict = Depends(get_current_user)):
+    if user.get("auth_provider") == "guest":
+        raise HTTPException(status_code=403, detail="Crea un account per reagire alle notizie")
+        
+    if req.reaction not in ["heart", "fire", "thumb"]:
+        raise HTTPException(status_code=400, detail="Reazione non valida")
+        
+    news_item = await db.news_feed.find_one({"news_id": news_id})
+    if not news_item:
+        raise HTTPException(status_code=404, detail="Notizia non trovata")
+        
+    uid = user["user_id"]
+    reactions = news_item.get("reactions", {"heart": [], "fire": [], "thumb": []})
+    
+    # Se l'utente ha già messo questa specifica reazione, la togliamo. Altrimenti la aggiungiamo.
+    current_list = reactions.get(req.reaction, [])
+    if uid in current_list:
+        current_list.remove(uid)
+        status = "removed"
+    else:
+        current_list.append(uid)
+        status = "added"
+        
+    reactions[req.reaction] = current_list
+    await db.news_feed.update_one({"news_id": news_id}, {"$set": {"reactions": reactions}})
+    
+    return {"ok": True, "status": status, "reactions": reactions}
+
+# ==========================================
 # MOTORE NOTIFICHE ATTORI IN BACKGROUND
 # ==========================================
 async def background_actor_checker():
@@ -1967,6 +2089,8 @@ async def startup_db():
     
     # --- NUOVO: Avvia il motore delle notifiche in background ---
     asyncio.create_task(background_actor_checker())
+    # --- NUOVO: Avvia il motore che scarica le news ---
+    asyncio.create_task(background_news_syncer())
     
     logger.info("CineDiario backend ready")
 
