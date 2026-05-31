@@ -1982,35 +1982,64 @@ async def background_news_syncer():
 @api_router.get("/news")
 @limiter.limit("30/minute")
 async def get_news_feed(request: Request, user: dict = Depends(get_current_user)):
-    count = await db.news_feed.count_documents({})
-    if count == 0:
-        # 1. Inserisce subito un avviso di benvenuto in una frazione di secondo
-        now = datetime.now(timezone.utc)
-        doc = {
-            "news_id": "welcome_news_1", "type": "article", "source": "CineDiario",
-            "title": "🎉 Edicola in allestimento!",
-            "summary": "Stiamo scaricando le ultime notizie dal web. Scorri verso il basso per aggiornare l'app tra qualche secondo!",
-            "image_url": None, "url": None, "target_id": None, "published_at": now.isoformat(),
-            "reactions": {"heart": [], "fire": [], "thumb": []},
-            "created_at": now
-        }
-        await db.news_feed.insert_one(doc)
+    try:
+        # Se il database è vuoto, avviamo il motore di ricerca di nascosto
+        count = await db.news_feed.count_documents({})
+        if count == 0:
+            asyncio.create_task(fetch_and_save_news())
+            
+        cursor = db.news_feed.find({}, {"_id": 0}).sort("created_at", -1).limit(30)
+        items = []
         
-        # 2. Avvia la ricerca vera e propria di nascosto, senza far bloccare il telefono
-        asyncio.create_task(fetch_and_save_news())
-        
-    cursor = db.news_feed.find({}, {"_id": 0}).sort("created_at", -1).limit(30)
-    items = []
-    
-    async for doc in cursor:
-        if "created_at" in doc and hasattr(doc["created_at"], "isoformat"):
-            doc["created_at"] = doc["created_at"].isoformat()
-        items.append(doc)
-        
-    return {"items": items}
+        async for row in cursor:
+            try:
+                # Scudo contro le date non formattate o i documenti corrotti
+                if "created_at" in row and hasattr(row["created_at"], "isoformat"):
+                    row["created_at"] = row["created_at"].isoformat()
+                    
+                if not row.get("published_at"):
+                    row["published_at"] = datetime.now(timezone.utc).isoformat()
+                    
+                if "reactions" not in row:
+                    row["reactions"] = {"heart": [], "fire": [], "thumb": []}
+                    
+                items.append(row)
+            except Exception:
+                # Se questo singolo documento è difettoso, lo salta e passa al prossimo
+                continue
+                
+        # SCUDO ANTI-VUOTO: Se non ci sono notizie o ci vuole troppo tempo
+        if not items:
+            items.append({
+                "news_id": "fake_1",
+                "type": "article",
+                "source": "CineDiario",
+                "title": "🎉 Sincronizzazione in corso...",
+                "summary": "Stiamo scaricando i dati. Attendi 10 secondi e ricarica la pagina!",
+                "image_url": None,
+                "url": None,
+                "target_id": None,
+                "published_at": datetime.now(timezone.utc).isoformat(),
+                "reactions": {"heart": [], "fire": [], "thumb": []}
+            })
+            
+        return {"items": items}
 
-class ReactNewsReq(BaseModel):
-    reaction: str
+    except Exception as e:
+        logger.error(f"Errore critico in get_news_feed: {e}")
+        # SCUDO DEBUG: Se c'è un errore fatale, te lo stampa nell'app!
+        return {"items": [{
+            "news_id": "error_1",
+            "type": "article",
+            "source": "Errore Server",
+            "title": "🚨 Rilevato Problema Tecnico",
+            "summary": f"Dettaglio dell'errore: {str(e)}. Fai uno screen!",
+            "image_url": None,
+            "url": None,
+            "target_id": None,
+            "published_at": datetime.now(timezone.utc).isoformat(),
+            "reactions": {"heart": [], "fire": [], "thumb": []}
+        }]}
 
 @api_router.post("/news/{news_id}/react")
 @limiter.limit("30/minute")
