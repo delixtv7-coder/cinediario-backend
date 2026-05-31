@@ -1982,10 +1982,22 @@ async def background_news_syncer():
 @api_router.get("/news")
 @limiter.limit("30/minute")
 async def get_news_feed(request: Request, user: dict = Depends(get_current_user)):
-    # Controlla il database. Se vuoto, forza lo scaricamento all'istante
     count = await db.news_feed.count_documents({})
     if count == 0:
-        await fetch_and_save_news()
+        # 1. Inserisce subito un avviso di benvenuto in una frazione di secondo
+        now = datetime.now(timezone.utc)
+        doc = {
+            "news_id": "welcome_news_1", "type": "article", "source": "CineDiario",
+            "title": "🎉 Edicola in allestimento!",
+            "summary": "Stiamo scaricando le ultime notizie dal web. Scorri verso il basso per aggiornare l'app tra qualche secondo!",
+            "image_url": None, "url": None, "target_id": None, "published_at": now.isoformat(),
+            "reactions": {"heart": [], "fire": [], "thumb": []},
+            "created_at": now
+        }
+        await db.news_feed.insert_one(doc)
+        
+        # 2. Avvia la ricerca vera e propria di nascosto, senza far bloccare il telefono
+        asyncio.create_task(fetch_and_save_news())
         
     cursor = db.news_feed.find({}, {"_id": 0}).sort("created_at", -1).limit(30)
     items = []
