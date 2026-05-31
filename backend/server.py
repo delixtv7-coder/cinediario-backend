@@ -1880,7 +1880,7 @@ async def background_news_syncer():
             logger.info("Ricerca nuove notizie di cinema...")
             now = datetime.now(timezone.utc)
             
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=15.0) as client:
                 # 1. PESCA I FILM IN USCITA (TMDB)
                 try:
                     up = await tmdb_get("/movie/upcoming", {"region": "IT", "page": 1})
@@ -1894,11 +1894,10 @@ async def background_news_syncer():
                             "summary": m.get("overview") or "Scopri i dettagli di questa nuova uscita al cinema.",
                             "image_url": f"{TMDB_IMG}{m['backdrop_path']}" if m.get("backdrop_path") else None,
                             "source": "TMDB",
-                            "url": None, # Se è None, l'app aprirà la pagina del film internamente
+                            "url": None, 
                             "target_id": str(m['id']),
                             "published_at": m.get("release_date")
                         }
-                        # Salviamo nel DB solo se è nuovo. Creiamo i cestini vuoti per le reazioni.
                         await db.news_feed.update_one(
                             {"news_id": nid}, 
                             {"$setOnInsert": {**doc, "reactions": {"heart": [], "fire": [], "thumb": []}, "created_at": now}}, 
@@ -1910,14 +1909,20 @@ async def background_news_syncer():
                 # 2. PESCA LE NOTIZIE VERE E PROPRIE (RSS ANSA CINEMA)
                 try:
                     rss_url = "https://www.ansa.it/sito/notizie/cultura/cinema/cinema_rss.xml"
-                    resp = await client.get(rss_url)
+                    
+                    # TRUCCO ANTI-BOT: Fingiamo di essere un normale browser Chrome!
+                    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+                    
+                    resp = await client.get(rss_url, headers=headers)
                     if resp.status_code == 200:
+                        # Importazione sicura per evitare crash
+                        import xml.etree.ElementTree as ET 
                         root = ET.fromstring(resp.text)
+                        
                         for item in root.findall(".//item")[:10]:
                             link = item.findtext("link")
                             if not link: continue
                             
-                            # Creiamo un ID univoco basato sul link dell'articolo
                             nid = f"rss_{uuid.uuid5(uuid.NAMESPACE_URL, link).hex}"
                             desc = item.findtext("description")
                             if desc: 
@@ -1930,7 +1935,7 @@ async def background_news_syncer():
                                 "summary": desc[:200] + "..." if desc and len(desc) > 200 else desc,
                                 "image_url": None, 
                                 "source": "ANSA Cinema",
-                                "url": link, # L'app capirà di dover aprire il browser a questo link
+                                "url": link, 
                                 "target_id": None,
                                 "published_at": now.isoformat()
                             }
@@ -1939,6 +1944,8 @@ async def background_news_syncer():
                                 {"$setOnInsert": {**doc, "reactions": {"heart": [], "fire": [], "thumb": []}, "created_at": now}}, 
                                 upsert=True
                             )
+                    else:
+                        logger.error(f"ANSA ha rifiutato la connessione: {resp.status_code}")
                 except Exception as e:
                     logger.error(f"Errore sincronizzazione RSS: {e}")
 
@@ -1951,43 +1958,16 @@ async def background_news_syncer():
 @api_router.get("/news")
 @limiter.limit("30/minute")
 async def get_news_feed(request: Request, user: dict = Depends(get_current_user)):
-    # Restituisce le ultime 30 notizie salvate, dalla più recente alla più vecchia
     cursor = db.news_feed.find({}, {"_id": 0}).sort("created_at", -1).limit(30)
-    items = await cursor.to_list(length=30)
+    items = []
+    
+    async for doc in cursor:
+        # TRUCCO DATA: Trasformiamo la data di sistema in testo leggibile dall'App
+        if "created_at" in doc and hasattr(doc["created_at"], "isoformat"):
+            doc["created_at"] = doc["created_at"].isoformat()
+        items.append(doc)
+        
     return {"items": items}
-
-class ReactNewsReq(BaseModel):
-    reaction: str # Deve essere "heart", "fire" o "thumb"
-
-@api_router.post("/news/{news_id}/react")
-@limiter.limit("30/minute")
-async def toggle_news_reaction(request: Request, news_id: str, req: ReactNewsReq, user: dict = Depends(get_current_user)):
-    if user.get("auth_provider") == "guest":
-        raise HTTPException(status_code=403, detail="Crea un account per reagire alle notizie")
-        
-    if req.reaction not in ["heart", "fire", "thumb"]:
-        raise HTTPException(status_code=400, detail="Reazione non valida")
-        
-    news_item = await db.news_feed.find_one({"news_id": news_id})
-    if not news_item:
-        raise HTTPException(status_code=404, detail="Notizia non trovata")
-        
-    uid = user["user_id"]
-    reactions = news_item.get("reactions", {"heart": [], "fire": [], "thumb": []})
-    
-    # Se l'utente ha già messo questa specifica reazione, la togliamo. Altrimenti la aggiungiamo.
-    current_list = reactions.get(req.reaction, [])
-    if uid in current_list:
-        current_list.remove(uid)
-        status = "removed"
-    else:
-        current_list.append(uid)
-        status = "added"
-        
-    reactions[req.reaction] = current_list
-    await db.news_feed.update_one({"news_id": news_id}, {"$set": {"reactions": reactions}})
-    
-    return {"ok": True, "status": status, "reactions": reactions}
 
 # ==========================================
 # MOTORE NOTIFICHE ATTORI IN BACKGROUND
