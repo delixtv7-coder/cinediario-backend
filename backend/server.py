@@ -1872,97 +1872,93 @@ async def unhandled_exception(request: Request, exc: Exception):
 # SEZIONE NEWS (EDICOLA)
 # ==========================================
 
+async def fetch_and_save_news():
+    """Funzione core che scarica le notizie. Può essere chiamata sia dal background che manualmente in emergenza."""
+    now = datetime.now(timezone.utc)
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        # 1. PESCA I FILM IN USCITA (TMDB)
+        try:
+            up = await tmdb_get("/movie/upcoming", {"region": "IT", "page": 1})
+            for m in up.get("results", [])[:10]:
+                if not m.get("release_date"): continue
+                nid = f"tmdb_{m['id']}"
+                doc = {
+                    "news_id": nid,
+                    "type": "upcoming",
+                    "title": f"🎬 Prossimamente: {m['title']}",
+                    "summary": m.get("overview") or "Scopri i dettagli di questa nuova uscita al cinema.",
+                    "image_url": f"{TMDB_IMG}{m['backdrop_path']}" if m.get("backdrop_path") else None,
+                    "source": "TMDB",
+                    "url": None, 
+                    "target_id": str(m['id']),
+                    "published_at": m.get("release_date")
+                }
+                await db.news_feed.update_one(
+                    {"news_id": nid}, 
+                    {"$setOnInsert": {**doc, "reactions": {"heart": [], "fire": [], "thumb": []}, "created_at": now}}, 
+                    upsert=True
+                )
+        except Exception as e:
+            logger.error(f"Errore TMDB news: {e}")
+
+        # 2. PESCA LE NOTIZIE VERE E PROPRIE (RSS ANSA CINEMA)
+        try:
+            rss_url = "https://www.ansa.it/sito/notizie/cultura/cinema/cinema_rss.xml"
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            resp = await client.get(rss_url, headers=headers)
+            if resp.status_code == 200:
+                import xml.etree.ElementTree as ET 
+                root = ET.fromstring(resp.text)
+                for item in root.findall(".//item")[:10]:
+                    link = item.findtext("link")
+                    if not link: continue
+                    
+                    nid = f"rss_{uuid.uuid5(uuid.NAMESPACE_URL, link).hex}"
+                    desc = item.findtext("description")
+                    if desc: 
+                        desc = desc.replace("<br/>", "\n").replace("<br>", "\n")
+                    
+                    doc = {
+                        "news_id": nid,
+                        "type": "article",
+                        "title": item.findtext("title"),
+                        "summary": desc[:200] + "..." if desc and len(desc) > 200 else desc,
+                        "image_url": None, 
+                        "source": "ANSA Cinema",
+                        "url": link, 
+                        "target_id": None,
+                        "published_at": now.isoformat()
+                    }
+                    await db.news_feed.update_one(
+                        {"news_id": nid}, 
+                        {"$setOnInsert": {**doc, "reactions": {"heart": [], "fire": [], "thumb": []}, "created_at": now}}, 
+                        upsert=True
+                    )
+        except Exception as e:
+            logger.error(f"Errore RSS: {e}")
+
 async def background_news_syncer():
     """Motore che gira in background e aggiorna le news ogni 2 ore"""
     while True:
         try:
-            await asyncio.sleep(10) # Partenza ritardata all'avvio
-            logger.info("Ricerca nuove notizie di cinema...")
-            now = datetime.now(timezone.utc)
-            
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                # 1. PESCA I FILM IN USCITA (TMDB)
-                try:
-                    up = await tmdb_get("/movie/upcoming", {"region": "IT", "page": 1})
-                    for m in up.get("results", [])[:10]:
-                        if not m.get("release_date"): continue
-                        nid = f"tmdb_{m['id']}"
-                        doc = {
-                            "news_id": nid,
-                            "type": "upcoming",
-                            "title": f"🎬 Prossimamente: {m['title']}",
-                            "summary": m.get("overview") or "Scopri i dettagli di questa nuova uscita al cinema.",
-                            "image_url": f"{TMDB_IMG}{m['backdrop_path']}" if m.get("backdrop_path") else None,
-                            "source": "TMDB",
-                            "url": None, 
-                            "target_id": str(m['id']),
-                            "published_at": m.get("release_date")
-                        }
-                        await db.news_feed.update_one(
-                            {"news_id": nid}, 
-                            {"$setOnInsert": {**doc, "reactions": {"heart": [], "fire": [], "thumb": []}, "created_at": now}}, 
-                            upsert=True
-                        )
-                except Exception as e:
-                    logger.error(f"Errore sincronizzazione TMDB Upcoming: {e}")
-
-                # 2. PESCA LE NOTIZIE VERE E PROPRIE (RSS ANSA CINEMA)
-                try:
-                    rss_url = "https://www.ansa.it/sito/notizie/cultura/cinema/cinema_rss.xml"
-                    
-                    # TRUCCO ANTI-BOT: Fingiamo di essere un normale browser Chrome!
-                    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
-                    
-                    resp = await client.get(rss_url, headers=headers)
-                    if resp.status_code == 200:
-                        # Importazione sicura per evitare crash
-                        import xml.etree.ElementTree as ET 
-                        root = ET.fromstring(resp.text)
-                        
-                        for item in root.findall(".//item")[:10]:
-                            link = item.findtext("link")
-                            if not link: continue
-                            
-                            nid = f"rss_{uuid.uuid5(uuid.NAMESPACE_URL, link).hex}"
-                            desc = item.findtext("description")
-                            if desc: 
-                                desc = desc.replace("<br/>", "\n").replace("<br>", "\n")
-                            
-                            doc = {
-                                "news_id": nid,
-                                "type": "article",
-                                "title": item.findtext("title"),
-                                "summary": desc[:200] + "..." if desc and len(desc) > 200 else desc,
-                                "image_url": None, 
-                                "source": "ANSA Cinema",
-                                "url": link, 
-                                "target_id": None,
-                                "published_at": now.isoformat()
-                            }
-                            await db.news_feed.update_one(
-                                {"news_id": nid}, 
-                                {"$setOnInsert": {**doc, "reactions": {"heart": [], "fire": [], "thumb": []}, "created_at": now}}, 
-                                upsert=True
-                            )
-                    else:
-                        logger.error(f"ANSA ha rifiutato la connessione: {resp.status_code}")
-                except Exception as e:
-                    logger.error(f"Errore sincronizzazione RSS: {e}")
-
+            await asyncio.sleep(10)
+            await fetch_and_save_news()
         except Exception as e:
-            logger.error(f"Errore generale loop news: {e}")
-        
-        # Attende 2 ore prima di cercare nuove notizie
+            logger.error(f"Errore loop news: {e}")
         await asyncio.sleep(7200)
 
 @api_router.get("/news")
 @limiter.limit("30/minute")
 async def get_news_feed(request: Request, user: dict = Depends(get_current_user)):
+    # TATTICA DI EMERGENZA: Se il database è vuoto, forziamo lo scaricamento all'istante!
+    count = await db.news_feed.count_documents({})
+    if count == 0:
+        await fetch_and_save_news()
+        
     cursor = db.news_feed.find({}, {"_id": 0}).sort("created_at", -1).limit(30)
     items = []
     
     async for doc in cursor:
-        # TRUCCO DATA: Trasformiamo la data di sistema in testo leggibile dall'App
         if "created_at" in doc and hasattr(doc["created_at"], "isoformat"):
             doc["created_at"] = doc["created_at"].isoformat()
         items.append(doc)
