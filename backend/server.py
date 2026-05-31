@@ -340,25 +340,25 @@ async def tmdb_get(path: str, params: dict = None, cache_hours: int = 48) -> dic
     if params:
         p.update(params)
         
-    # 1. Generiamo una "chiave" unica basata su cosa l'utente ha cercato
-    # Es: "/search/movie?language=it-IT&query=Inception"
     query_string = "&".join(f"{k}={v}" for k, v in sorted(p.items()))
     cache_key = f"{path}?{query_string}"
     
     now = datetime.now(timezone.utc)
     
-    # 2. Controlliamo se abbiamo GIA' questa risposta salvata nel database
     try:
         cached = await db.tmdb_cache.find_one({"_id": cache_key})
         if cached:
-            # Controlliamo che la ricerca non sia più vecchia di 48 ore
-            delta = (now - cached["updated_at"]).total_seconds()
+            # FIX: Convertiamo sempre la data in UTC per evitare crash di fuso orario
+            cached_time = cached["updated_at"]
+            if cached_time.tzinfo is None:
+                cached_time = cached_time.replace(tzinfo=timezone.utc)
+            
+            delta = (now - cached_time).total_seconds()
             if delta < (cache_hours * 3600):
                 return cached["data"]
     except Exception as e:
         logger.error(f"Errore lettura cache TMDB: {e}")
 
-    # 3. Se NON c'è, o è scaduta, chiediamo i dati veri a TMDB
     async with httpx.AsyncClient(timeout=15.0) as c:
         r = await c.get(f"{TMDB_BASE}{path}", headers=TMDB_HEADERS, params=p)
         if r.status_code != 200:
@@ -366,7 +366,6 @@ async def tmdb_get(path: str, params: dict = None, cache_hours: int = 48) -> dic
         
         data = r.json()
         
-        # 4. Salviamo i dati freschi nel Database per i prossimi utenti!
         try:
             await db.tmdb_cache.update_one(
                 {"_id": cache_key},
@@ -1869,11 +1868,11 @@ async def unhandled_exception(request: Request, exc: Exception):
     return JSONResponse(status_code=500, content={"detail": f"{type(exc).__name__}: {exc}"})
 
 # ==========================================
-# SEZIONE NEWS (EDICOLA)
+# SEZIONE NEWS (EDICOLA) E REAZIONI
 # ==========================================
 
 async def fetch_and_save_news():
-    """Funzione core che scarica le notizie. Può essere chiamata sia dal background che manualmente in emergenza."""
+    """Funzione core che scarica le notizie aggirando i blocchi anti-bot."""
     now = datetime.now(timezone.utc)
     async with httpx.AsyncClient(timeout=15.0) as client:
         # 1. PESCA I FILM IN USCITA (TMDB)
@@ -1901,41 +1900,47 @@ async def fetch_and_save_news():
         except Exception as e:
             logger.error(f"Errore TMDB news: {e}")
 
-        # 2. PESCA LE NOTIZIE VERE E PROPRIE (RSS ANSA CINEMA)
-        try:
-            rss_url = "https://www.ansa.it/sito/notizie/cultura/cinema/cinema_rss.xml"
-            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-            resp = await client.get(rss_url, headers=headers)
-            if resp.status_code == 200:
-                import xml.etree.ElementTree as ET 
-                root = ET.fromstring(resp.text)
-                for item in root.findall(".//item")[:10]:
-                    link = item.findtext("link")
-                    if not link: continue
-                    
-                    nid = f"rss_{uuid.uuid5(uuid.NAMESPACE_URL, link).hex}"
-                    desc = item.findtext("description")
-                    if desc: 
-                        desc = desc.replace("<br/>", "\n").replace("<br>", "\n")
-                    
-                    doc = {
-                        "news_id": nid,
-                        "type": "article",
-                        "title": item.findtext("title"),
-                        "summary": desc[:200] + "..." if desc and len(desc) > 200 else desc,
-                        "image_url": None, 
-                        "source": "ANSA Cinema",
-                        "url": link, 
-                        "target_id": None,
-                        "published_at": now.isoformat()
-                    }
-                    await db.news_feed.update_one(
-                        {"news_id": nid}, 
-                        {"$setOnInsert": {**doc, "reactions": {"heart": [], "fire": [], "thumb": []}, "created_at": now}}, 
-                        upsert=True
-                    )
-        except Exception as e:
-            logger.error(f"Errore RSS: {e}")
+        # 2. PESCA LE NOTIZIE RSS (Fonti multiple per sicurezza)
+        rss_sources = [
+            ("ANSA Cinema", "https://www.ansa.it/sito/notizie/cultura/cinema/cinema_rss.xml"),
+            ("ComingSoon", "https://www.comingsoon.it/rss/news/")
+        ]
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        
+        for source_name, rss_url in rss_sources:
+            try:
+                resp = await client.get(rss_url, headers=headers)
+                if resp.status_code == 200:
+                    import xml.etree.ElementTree as ET 
+                    root = ET.fromstring(resp.text)
+                    for item in root.findall(".//item")[:8]:
+                        link = item.findtext("link")
+                        if not link: continue
+                        
+                        nid = f"rss_{uuid.uuid5(uuid.NAMESPACE_URL, link).hex}"
+                        desc = item.findtext("description")
+                        if desc: 
+                            # Pulizia del testo per evitare tag HTML sporchi
+                            desc = desc.replace("<br/>", "\n").replace("<br>", "\n").replace("<![CDATA[", "").replace("]]>", "")
+                        
+                        doc = {
+                            "news_id": nid,
+                            "type": "article",
+                            "title": item.findtext("title"),
+                            "summary": desc[:200] + "..." if desc and len(desc) > 200 else desc,
+                            "image_url": None, 
+                            "source": source_name,
+                            "url": link, 
+                            "target_id": None,
+                            "published_at": now.isoformat()
+                        }
+                        await db.news_feed.update_one(
+                            {"news_id": nid}, 
+                            {"$setOnInsert": {**doc, "reactions": {"heart": [], "fire": [], "thumb": []}, "created_at": now}}, 
+                            upsert=True
+                        )
+            except Exception as e:
+                logger.error(f"Errore RSS {source_name}: {e}")
 
 async def background_news_syncer():
     """Motore che gira in background e aggiorna le news ogni 2 ore"""
@@ -1964,6 +1969,38 @@ async def get_news_feed(request: Request, user: dict = Depends(get_current_user)
         items.append(doc)
         
     return {"items": items}
+
+class ReactNewsReq(BaseModel):
+    reaction: str
+
+@api_router.post("/news/{news_id}/react")
+@limiter.limit("30/minute")
+async def toggle_news_reaction(request: Request, news_id: str, req: ReactNewsReq, user: dict = Depends(get_current_user)):
+    if user.get("auth_provider") == "guest":
+        raise HTTPException(status_code=403, detail="Crea un account per reagire alle notizie")
+        
+    if req.reaction not in ["heart", "fire", "thumb"]:
+        raise HTTPException(status_code=400, detail="Reazione non valida")
+        
+    news_item = await db.news_feed.find_one({"news_id": news_id})
+    if not news_item:
+        raise HTTPException(status_code=404, detail="Notizia non trovata")
+        
+    uid = user["user_id"]
+    reactions = news_item.get("reactions", {"heart": [], "fire": [], "thumb": []})
+    
+    current_list = reactions.get(req.reaction, [])
+    if uid in current_list:
+        current_list.remove(uid)
+        status = "removed"
+    else:
+        current_list.append(uid)
+        status = "added"
+        
+    reactions[req.reaction] = current_list
+    await db.news_feed.update_one({"news_id": news_id}, {"$set": {"reactions": reactions}})
+    
+    return {"ok": True, "status": status, "reactions": reactions}
 
 # ==========================================
 # MOTORE NOTIFICHE ATTORI IN BACKGROUND
