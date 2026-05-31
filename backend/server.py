@@ -1871,26 +1871,25 @@ async def unhandled_exception(request: Request, exc: Exception):
 # SEZIONE NEWS (EDICOLA) E REAZIONI
 # ==========================================
 
+# ==========================================
+# SEZIONE NEWS (EDICOLA)
+# ==========================================
+
 async def fetch_and_save_news():
-    """Funzione core che scarica le notizie aggirando i blocchi anti-bot."""
     now = datetime.now(timezone.utc)
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        # 1. PESCA I FILM IN USCITA (TMDB)
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        # 1. TMDB UPCOMING (Senza limiti di regione per sicurezza)
         try:
-            up = await tmdb_get("/movie/upcoming", {"region": "IT", "page": 1})
-            for m in up.get("results", [])[:10]:
+            up = await tmdb_get("/movie/upcoming", {"page": 1})
+            for m in up.get("results", [])[:8]:
                 if not m.get("release_date"): continue
-                nid = f"tmdb_{m['id']}"
+                nid = f"tmdb_up_{m['id']}"
                 doc = {
-                    "news_id": nid,
-                    "type": "upcoming",
+                    "news_id": nid, "type": "upcoming", "source": "TMDB",
                     "title": f"🎬 Prossimamente: {m['title']}",
-                    "summary": m.get("overview") or "Scopri i dettagli di questa nuova uscita al cinema.",
+                    "summary": m.get("overview") or "Scopri i dettagli di questa uscita al cinema.",
                     "image_url": f"{TMDB_IMG}{m['backdrop_path']}" if m.get("backdrop_path") else None,
-                    "source": "TMDB",
-                    "url": None, 
-                    "target_id": str(m['id']),
-                    "published_at": m.get("release_date")
+                    "url": None, "target_id": str(m['id']), "published_at": m.get("release_date")
                 }
                 await db.news_feed.update_one(
                     {"news_id": nid}, 
@@ -1898,49 +1897,77 @@ async def fetch_and_save_news():
                     upsert=True
                 )
         except Exception as e:
-            logger.error(f"Errore TMDB news: {e}")
+            logger.error(f"Errore TMDB Upcoming: {e}")
 
-        # 2. PESCA LE NOTIZIE RSS (Fonti multiple per sicurezza)
-        rss_sources = [
-            ("ANSA Cinema", "https://www.ansa.it/sito/notizie/cultura/cinema/cinema_rss.xml"),
-            ("ComingSoon", "https://www.comingsoon.it/rss/news/")
-        ]
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        
-        for source_name, rss_url in rss_sources:
-            try:
-                resp = await client.get(rss_url, headers=headers)
-                if resp.status_code == 200:
-                    import xml.etree.ElementTree as ET 
-                    root = ET.fromstring(resp.text)
-                    for item in root.findall(".//item")[:8]:
-                        link = item.findtext("link")
-                        if not link: continue
-                        
-                        nid = f"rss_{uuid.uuid5(uuid.NAMESPACE_URL, link).hex}"
-                        desc = item.findtext("description")
-                        if desc: 
-                            # Pulizia del testo per evitare tag HTML sporchi
-                            desc = desc.replace("<br/>", "\n").replace("<br>", "\n").replace("<![CDATA[", "").replace("]]>", "")
-                        
-                        doc = {
-                            "news_id": nid,
-                            "type": "article",
-                            "title": item.findtext("title"),
-                            "summary": desc[:200] + "..." if desc and len(desc) > 200 else desc,
-                            "image_url": None, 
-                            "source": source_name,
-                            "url": link, 
-                            "target_id": None,
-                            "published_at": now.isoformat()
-                        }
-                        await db.news_feed.update_one(
-                            {"news_id": nid}, 
-                            {"$setOnInsert": {**doc, "reactions": {"heart": [], "fire": [], "thumb": []}, "created_at": now}}, 
-                            upsert=True
-                        )
-            except Exception as e:
-                logger.error(f"Errore RSS {source_name}: {e}")
+        # 2. TMDB ORA IN SALA (Garantisce sempre dei risultati)
+        try:
+            np = await tmdb_get("/movie/now_playing", {"page": 1})
+            for m in np.get("results", [])[:8]:
+                nid = f"tmdb_np_{m['id']}"
+                doc = {
+                    "news_id": nid, "type": "upcoming", "source": "Al Cinema",
+                    "title": f"🍿 Ora in sala: {m['title']}",
+                    "summary": m.get("overview") or "Attualmente in programmazione nei cinema.",
+                    "image_url": f"{TMDB_IMG}{m['backdrop_path']}" if m.get("backdrop_path") else None,
+                    "url": None, "target_id": str(m['id']), "published_at": m.get("release_date", now.isoformat())
+                }
+                await db.news_feed.update_one(
+                    {"news_id": nid}, 
+                    {"$setOnInsert": {**doc, "reactions": {"heart": [], "fire": [], "thumb": []}, "created_at": now}}, 
+                    upsert=True
+                )
+        except Exception as e:
+            logger.error(f"Errore TMDB Now Playing: {e}")
+
+        # 3. GOOGLE NEWS RSS (Aggira i blocchi ed è sempre aggiornato)
+        try:
+            rss_url = "https://news.google.com/rss/search?q=cinema+film&hl=it&gl=IT&ceid=IT:it"
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            resp = await client.get(rss_url, headers=headers)
+            if resp.status_code == 200:
+                import xml.etree.ElementTree as ET 
+                root = ET.fromstring(resp.text)
+                for item in root.findall(".//item")[:10]:
+                    link = item.findtext("link")
+                    if not link: continue
+                    nid = f"rss_{uuid.uuid5(uuid.NAMESPACE_URL, link).hex}"
+                    
+                    # Google formatta i titoli come "Titolo - Nome del Giornale"
+                    raw_title = item.findtext("title") or "Notizia"
+                    title_parts = raw_title.rsplit(" - ", 1)
+                    clean_title = title_parts[0]
+                    source_name = title_parts[1] if len(title_parts) > 1 else "Google News"
+                    
+                    doc = {
+                        "news_id": nid, "type": "article", "source": source_name,
+                        "title": clean_title,
+                        "summary": "Tocca per leggere l'articolo completo dalla fonte originale.",
+                        "image_url": None, "url": link, "target_id": None,
+                        "published_at": now.isoformat()
+                    }
+                    await db.news_feed.update_one(
+                        {"news_id": nid}, 
+                        {"$setOnInsert": {**doc, "reactions": {"heart": [], "fire": [], "thumb": []}, "created_at": now}}, 
+                        upsert=True
+                    )
+        except Exception as e:
+            logger.error(f"Errore Google News RSS: {e}")
+
+        # 4. IL SALVAGENTE MATEMATICO
+        # Se il database è ANCORA vuoto dopo tutti i tentativi, inseriamo una notizia finta per sbloccare l'app
+        total_docs = await db.news_feed.count_documents({})
+        if total_docs == 0:
+            doc = {
+                "news_id": "welcome_news_1", "type": "article", "source": "CineDiario",
+                "title": "🎉 Benvenuto nella nuova Edicola!",
+                "summary": "L'edicola è attiva. Attendi qualche minuto e ricarica la pagina per leggere le notizie vere!",
+                "image_url": None, "url": None, "target_id": None, "published_at": now.isoformat()
+            }
+            await db.news_feed.update_one(
+                {"news_id": "welcome_news_1"}, 
+                {"$setOnInsert": {**doc, "reactions": {"heart": [], "fire": [], "thumb": []}, "created_at": now}}, 
+                upsert=True
+            )
 
 async def background_news_syncer():
     """Motore che gira in background e aggiorna le news ogni 2 ore"""
@@ -1955,7 +1982,7 @@ async def background_news_syncer():
 @api_router.get("/news")
 @limiter.limit("30/minute")
 async def get_news_feed(request: Request, user: dict = Depends(get_current_user)):
-    # TATTICA DI EMERGENZA: Se il database è vuoto, forziamo lo scaricamento all'istante!
+    # Controlla il database. Se vuoto, forza lo scaricamento all'istante
     count = await db.news_feed.count_documents({})
     if count == 0:
         await fetch_and_save_news()
